@@ -9,6 +9,7 @@ This is the complete memory transfer from the design session that scoped Cast Bo
 - **User**: Abed
 - **Working directory**: `C:\Users\Abeds\Cursor projects\Chrome-cast-extension\`
 - **Current state of product**: **Phase 1 vertical slice SHIPS.** Windows desktop app + Chrome extension + Chrome Native Messaging bridge + session-aware HLS proxy + pychromecast control all working end-to-end. Verified by casting a real HLS stream from `masukestin.com` to a real Chromecast ("Dining room TV"), full HD optimized playback. Session-locked URLs solved. Next work is controls (play/pause/seek/skip in the popup) and then Phase 2 polish (installer, code signing, landing page, payments).
+- **Pillar 2 in progress**: P2.1 (ffmpeg foundation) shipped on branch `pillar-2.1/ffmpeg-foundation`. Spec at `docs/superpowers/specs/2026-05-15-pillar-2.1-ffmpeg-foundation-design.md`; plan at `docs/superpowers/plans/2026-05-15-pillar-2.1-ffmpeg-foundation.md`. Next sub-session: P2.2 (transcoder module).
 
 ---
 

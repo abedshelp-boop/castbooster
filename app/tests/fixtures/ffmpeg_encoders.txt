@@ -1,0 +1,21 @@
+Encoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V....D av1_nvenc            NVIDIA NVENC av1 encoder (codec av1)
+ V..... av1_qsv              AV1 (Intel Quick Sync Video acceleration) (codec av1)
+ V....D av1_amf              AMD AMF AV1 encoder (codec av1)
+ V....D h264_amf             AMD AMF H.264 Encoder (codec h264)
+ V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)
+ V..... h264_qsv             H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (Intel Quick Sync Video acceleration) (codec h264)
+ V..X.D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10
+ V....D hevc_amf             AMD AMF HEVC encoder (codec hevc)
+ A....D aac                  AAC (Advanced Audio Coding)
+ A..... opus                 Opus
+ S..... ass                  ASS (Advanced SubStation Alpha) subtitle

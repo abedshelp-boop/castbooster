@@ -34,3 +34,10 @@ htmlcov/
 
 # Per-developer Claude Code settings (permissions, etc.)
 .claude/settings.local.json
+
+# Vendored ffmpeg (fetched by app/scripts/fetch_ffmpeg.ps1; too large for git)
+app/castbooster/bin/*.exe
+app/castbooster/bin/*.dll
+app/castbooster/bin/*.7z
+app/castbooster/bin/*.zip
+app/castbooster/bin/LICENSE.ffmpeg.txt
