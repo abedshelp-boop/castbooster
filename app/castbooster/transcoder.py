@@ -427,7 +427,7 @@ class Transcoder:
         self,
         input_url: str,
         output_dir: Optional[Path] = None,
-        accel: AccelProfile = None,                  # required; type-checked below
+        accel: Optional[AccelProfile] = None,          # required; type-checked below
         *,
         base_output_dir: Optional[Path] = None,
         filter_chain: Optional[FilterChain] = None,
@@ -457,6 +457,7 @@ class Transcoder:
         self._next: Optional[_ProcessSlot] = None      # Task 6 populates this
         self._slot_counter: int = 0                    # Task 6 increments this
         self._last_reload_error: Optional[str] = None
+        self._filter_chain_pending: Optional[FilterChain] = None
 
     # ---- public properties ----
     @property
@@ -584,9 +585,117 @@ class Transcoder:
             # Ignore callbacks if we're already TERMINATING/TERMINATED
             if self._state in (TranscoderState.TERMINATING, TranscoderState.TERMINATED):
                 return
+            # Ignore callbacks from slots that are no longer _current (e.g. OLD
+            # slot being stopped after a successful promotion).
+            if slot is not self._current:
+                return
+            if self._next is not None:
+                # We're RELOADING. The public state aggregate stays RELOADING
+                # regardless of _current's sub-state changes. _current may even
+                # transition to FAILED here (OLD dies mid-reload); we still let
+                # NEW try to come up. Final state is reconciled in
+                # set_filter_chain after _next's ready_event fires.
+                return
             # Map _SlotState → TranscoderState (1:1 in Task 1; Task 6 adds RELOADING logic)
             mapped = _SUBSTATE_TO_STATE[new_sub_state]
             self._set_state_locked(mapped, idle_reason=slot.idle_reason)
+
+    def _on_next_substate_change(
+        self, slot: _ProcessSlot, new_sub_state: _SlotState
+    ) -> None:
+        """Callback for the _next slot. We don't update public state here —
+        set_filter_chain's blocked thread does that via _next.ready_event.
+        """
+        # No-op for Task 6: the blocked thread in set_filter_chain handles the
+        # promotion/demotion decision after wait_until_ready() returns.
+        pass
+
+    def _aggregate_current_state_locked(self) -> TranscoderState:
+        """Map _current's sub_state to a public TranscoderState. Caller MUST hold _state_lock."""
+        if self._current is None:
+            return TranscoderState.IDLE
+        return _SUBSTATE_TO_STATE[self._current.sub_state]
+
+    def set_filter_chain(self, chain: FilterChain) -> bool:
+        """Hot-reload the filter chain.
+
+        Blocks until NEW reaches READY (returns True; OLD killed; cast continues
+        with the new chain) or NEW fails to reach READY (returns False; OLD still
+        streaming; chain unchanged; last_reload_error set).
+
+        Raises RuntimeError if called in IDLE/SPAWNING/WARMING/FAILED/TERMINATING/
+        TERMINATED, or if a reload is already in progress.
+        """
+        with self._state_lock:
+            if self._state in (
+                TranscoderState.IDLE, TranscoderState.SPAWNING, TranscoderState.WARMING,
+                TranscoderState.FAILED, TranscoderState.TERMINATING, TranscoderState.TERMINATED,
+            ):
+                raise RuntimeError(
+                    f"set_filter_chain in state {self._state.name}; "
+                    f"only READY/STREAMING/STALLED can initiate a reload"
+                )
+            if self._next is not None:
+                raise RuntimeError("set_filter_chain: reload already in progress")
+            # Allocate NEW slot
+            self._slot_counter += 1
+            new_dir = self._base_output_dir / f"v{self._slot_counter}"
+            self._next = _ProcessSlot(
+                output_dir=new_dir,
+                warming_timeout=self._warming_timeout,
+                stall_timeout=self._stall_timeout,
+                poll_interval=self._poll_interval,
+                on_sub_state_change=self._on_next_substate_change,
+            )
+            self._filter_chain_pending = chain
+            self._set_state_locked(TranscoderState.RELOADING)
+
+        # Build argv with the new chain
+        argv = _build_argv(
+            input_url=self._input_url,
+            output_dir=new_dir,
+            accel=self._accel,
+            hls_segment_seconds=self._hls_segment_seconds,
+            vf_fragment=chain.render(self._input_url),
+        )
+        self._next.start(argv)
+
+        # Block until NEW reaches READY or FAILED (or timeout)
+        promoted = self._next.wait_until_ready(timeout=self._warming_timeout)
+
+        next_to_stop: Optional[_ProcessSlot] = None
+        result: bool = False
+
+        with self._state_lock:
+            if self._state in (TranscoderState.TERMINATING, TranscoderState.TERMINATED):
+                # Caller called stop() during the wait — clean up NEW
+                next_to_stop = self._next
+                self._next = None
+                self._filter_chain_pending = None
+                result = False
+            elif not promoted or self._next.sub_state == _SlotState.FAILED:
+                # Task 7 expands this path; happy path here doesn't exercise it.
+                self._last_reload_error = self._next.idle_reason or "reload_warming_timed_out"
+                next_to_stop = self._next
+                self._next = None
+                self._filter_chain_pending = None
+                self._set_state_locked(self._aggregate_current_state_locked())
+                result = False
+            else:
+                # Promote
+                next_to_stop = self._current
+                self._current = self._next
+                self._next = None
+                self._filter_chain = self._filter_chain_pending
+                self._filter_chain_pending = None
+                self._last_reload_error = None
+                self._set_state_locked(self._aggregate_current_state_locked())
+                result = True
+
+        # Stop OLD outside the lock (rmtree is slow on Windows)
+        if next_to_stop is not None:
+            next_to_stop.stop()
+        return result
 
 
 # Per-encoder flags. Values verified against current ffmpeg HLS muxer +
