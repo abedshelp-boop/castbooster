@@ -63,3 +63,61 @@ class FilterChain:
             non_null = [p for p in parts if p != "null"]
             parts = non_null or ["null"]
         return ",".join(parts)
+
+
+def _escape_for_subtitles_filter(path: str) -> str:
+    """Escape a filesystem path for use inside ffmpeg's subtitles= filter argument.
+
+    Strategy per ffmpeg-all docs (filtergraph escaping §32.1):
+      1. Wrap in single quotes — preserves ':', '=', ',' inside the option value.
+      2. Double any backslashes inside the quotes.
+      3. If the path contains a literal apostrophe, splice with '\\'' per the
+         ffmpeg example "Crime d'\\''Amour".
+
+    Examples:
+        /tmp/sample.mkv  →  '/tmp/sample.mkv'
+        C:\\foo\\bar.mkv  →  'C:\\\\foo\\\\bar.mkv'
+        /x/Crime d'Amour.mkv  →  '/x/Crime d'\\''Amour.mkv'
+    """
+    inner = path.replace("\\", "\\\\")
+    inner = inner.replace("'", "'\\''")
+    return f"'{inner}'"
+
+
+class SubtitleBurnIn:
+    """Burns an embedded subtitle stream into the video frame.
+
+    Args:
+        stream_index: zero-based subtitle stream index in the source.
+                      Default 0 (first embedded sub track).
+
+    The filter's input file is supplied via FilterChain._bind() — it must
+    match the transcoder's -i target because ffmpeg's subtitles= filter
+    re-reads the file to demux the sub stream.
+
+    Render: subtitles=<escaped_input_url>:si=<stream_index>
+
+    Requires ffmpeg compiled with --enable-libass. The vendored Gyan
+    Windows build includes libass.
+
+    External .srt / .ass file support (path argument instead of bound
+    input_url) is deferred to P2.5+.
+    """
+
+    def __init__(self, stream_index: int = 0) -> None:
+        self.stream_index = stream_index
+        self._input_url: str | None = None
+
+    def _bind(self, input_url: str) -> None:
+        """Called by FilterChain.render() before this stage's render()."""
+        self._input_url = input_url
+
+    def render(self) -> str:
+        if self._input_url is None:
+            raise RuntimeError(
+                "SubtitleBurnIn.render() called before FilterChain bound an input. "
+                "Pass this stage to a FilterChain whose render(input_url) is called "
+                "by the Transcoder."
+            )
+        escaped = _escape_for_subtitles_filter(self._input_url)
+        return f"subtitles={escaped}:si={self.stream_index}"
