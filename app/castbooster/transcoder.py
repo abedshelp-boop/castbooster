@@ -221,11 +221,42 @@ class Transcoder:
             return False, seg_count
         return True, seg_count
 
+    def _check_process_exit_locked(self) -> bool:
+        """Returns True iff state transitioned to FAILED due to subprocess exit.
+        Caller must NOT hold _state_lock — this method acquires it briefly.
+        """
+        assert self._process is not None
+        code = self._process.poll()
+        if code is None:
+            return False
+        with self._state_lock:
+            self._exit_code = code
+            if self._state in (
+                TranscoderState.SPAWNING,
+                TranscoderState.WARMING,
+            ):
+                self._set_state_locked(
+                    TranscoderState.FAILED,
+                    idle_reason="subprocess_died_early",
+                )
+                return True
+            if self._state in (
+                TranscoderState.READY,
+                TranscoderState.STREAMING,
+                TranscoderState.STALLED,
+            ) and code != 0:
+                self._set_state_locked(
+                    TranscoderState.FAILED, idle_reason="unknown"
+                )
+                return True
+            # state already FAILED/TERMINATING/TERMINATED, or exited 0 post-READY
+            return False
+
     def _watchdog_poller_loop(self) -> None:
         """Drives WARMING -> READY -> STREAMING <-> STALLED + early-exit /
         timeout failures. Exits when state is FAILED or TERMINATED.
 
-        Later tasks (9, 10, 11, 12) extend this loop. Keep it readable.
+        Later tasks (11, 12) extend this loop. Keep it readable.
         """
         while not self._stop_requested.is_set():
             time.sleep(self._poll_interval)
@@ -236,6 +267,11 @@ class Transcoder:
                 TranscoderState.TERMINATING,
                 TranscoderState.TERMINATED,
             ):
+                return
+
+            # Check subprocess health FIRST so an exited proc can't be reported
+            # as READY just because someone touched files at the right moment.
+            if self._check_process_exit_locked():
                 return
 
             if current == TranscoderState.WARMING:

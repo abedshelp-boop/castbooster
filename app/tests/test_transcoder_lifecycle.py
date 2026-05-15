@@ -476,3 +476,28 @@ def test_warming_to_failed_on_timeout(tmp_path, sw_profile):
             assert t.idle_reason == "warming_timed_out"
         finally:
             t.stop()
+
+
+# ---------- WARMING -> FAILED on early exit ----------------------------------
+
+def test_warming_to_failed_on_early_exit(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            # Subprocess dies with no fatal stderr pattern beforehand
+            fake.set_exit(1)
+            assert _wait_for_state(t, TranscoderState.FAILED, timeout=1.0), \
+                f"state={t.state}"
+            assert t.idle_reason == "subprocess_died_early"
+            assert t.exit_code == 1
+        finally:
+            t.stop()
