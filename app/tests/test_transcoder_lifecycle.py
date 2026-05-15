@@ -674,3 +674,24 @@ def test_stop_drains_via_stdin_q(tmp_path, sw_profile):
         t.stop(drain_seconds=1.0)
         assert fake.stdin.getvalue() == b"q\n"
         assert t.state == TranscoderState.TERMINATED
+
+
+def test_stop_kills_after_drain_timeout(tmp_path, sw_profile):
+    """Fake ignores q\\n → stop() must call process.kill() after drain_seconds."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        # Fake never sets exit on its own — stop() must escalate
+        start = time.monotonic()
+        t.stop(drain_seconds=0.1)
+        elapsed = time.monotonic() - start
+        assert t.state == TranscoderState.TERMINATED
+        assert fake.poll() == -9, "kill() should set exit code to -9"
+        assert elapsed < 2.0, f"stop() took {elapsed:.2f}s — escalation too slow"

@@ -242,8 +242,14 @@ class Transcoder:
             try:
                 self._exit_code = self._process.wait(timeout=drain_seconds)
             except subprocess.TimeoutExpired:
-                # Hard kill lands in Task 15
-                log.warning("graceful drain timed out — hard-kill in Task 15")
+                log.warning("graceful drain timed out — escalating to kill")
+                try:
+                    self._process.kill()
+                    self._exit_code = self._process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    log.error("ffmpeg refused to die even after kill()")
+                except Exception:
+                    log.exception("hard kill failed")
 
         # 3) Reap threads
         for th in (self._stderr_thread, self._poller_thread):
