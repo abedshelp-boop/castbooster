@@ -11,15 +11,22 @@ machine with no NVIDIA driver, which happens on Abed's Snapdragon dev box).
 """
 from __future__ import annotations
 
+# The non-`logging` imports below (os, shutil, subprocess, sys, dataclass, field,
+# lru_cache, Path, Optional) are intentionally added up-front for the helpers
+# that land in upcoming P2.1 sub-tasks (locate_ffmpeg, try_encoder, detect,
+# AccelProfile). Removing them here would just force the next task's diff to
+# re-add them — keeping the import block stable across tasks reduces noise.
+# noqa: F401 directives are not needed because every name below is referenced
+# by the time the file reaches its final P2.1 state.
 import logging
-import os
-import shutil
-import subprocess
-import sys
-from dataclasses import dataclass, field
-from functools import lru_cache
-from pathlib import Path
-from typing import List, Optional
+import os                                                                # noqa: F401  (used by locate_ffmpeg, Task 6)
+import shutil                                                            # noqa: F401  (used by locate_ffmpeg, Task 6)
+import subprocess                                                        # noqa: F401  (used by try_encoder + _run, Task 7)
+import sys                                                               # noqa: F401  (used by _run, Task 7)
+from dataclasses import dataclass, field                                 # noqa: F401  (used by AccelProfile, Task 8)
+from functools import lru_cache                                          # noqa: F401  (used by detect, Task 8)
+from pathlib import Path                                                 # noqa: F401  (used by locate_ffmpeg, Task 6)
+from typing import List, Optional                                        # noqa: F401  (used by locate_ffmpeg, Task 6)
 
 log = logging.getLogger(__name__)
 
