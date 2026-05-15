@@ -217,11 +217,43 @@ class Transcoder:
         )
 
     def stop(self, drain_seconds: float = 2.0) -> None:
-        # Full lifecycle teardown lands in later tasks. Minimal no-op for now
-        # so test setUps that call stop() in finally blocks don't crash.
+        """Initiate TERMINATING flow. Idempotent: a second call is a no-op
+        once state is already TERMINATING/TERMINATED."""
+        with self._state_lock:
+            if self._state in (
+                TranscoderState.TERMINATING,
+                TranscoderState.TERMINATED,
+            ):
+                return
+            prior_state = self._state
+            self._set_state_locked(TranscoderState.TERMINATING)
+
         self._stop_requested.set()
+
+        # 1) Try graceful drain — write q\n to ffmpeg's stdin
+        if self._process is not None:
+            try:
+                if self._process.stdin is not None:
+                    self._process.stdin.write(b"q\n")
+                    self._process.stdin.flush()
+            except Exception:
+                log.exception("stdin q-shutdown failed")
+            # 2) Wait for self-exit
+            try:
+                self._exit_code = self._process.wait(timeout=drain_seconds)
+            except subprocess.TimeoutExpired:
+                # Hard kill lands in Task 15
+                log.warning("graceful drain timed out — hard-kill in Task 15")
+
+        # 3) Reap threads
+        for th in (self._stderr_thread, self._poller_thread):
+            if th is not None and th.is_alive():
+                th.join(timeout=1.0)
+
         with self._state_lock:
             self._set_state_locked(TranscoderState.TERMINATED)
+        # Output dir cleanup lands in Task 17
+        _ = prior_state  # reserved for future logging
 
     def _is_ready_on_disk(self) -> tuple[bool, int]:
         """Returns (ready, seg_count). Ready iff >= 2 segs AND master AND variant exist."""

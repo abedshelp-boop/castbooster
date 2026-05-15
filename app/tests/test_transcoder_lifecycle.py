@@ -648,3 +648,29 @@ def test_wait_until_ready_false_on_timeout(tmp_path, sw_profile):
             assert t.wait_until_ready(timeout=0.2) is False
         finally:
             t.stop()
+
+
+# ---------- stop() graceful drain --------------------------------------------
+
+def test_stop_drains_via_stdin_q(tmp_path, sw_profile):
+    """stop() must write b"q\\n" to ffmpeg's stdin (its documented clean
+    shutdown). Reliable on Windows where SIGTERM is flaky."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        # Have the fake "exit" shortly after seeing the q so drain completes
+        def graceful():
+            # Wait briefly, then accept the shutdown
+            time.sleep(0.05)
+            fake.set_exit(0)
+        threading.Thread(target=graceful, daemon=True).start()
+        t.stop(drain_seconds=1.0)
+        assert fake.stdin.getvalue() == b"q\n"
+        assert t.state == TranscoderState.TERMINATED
