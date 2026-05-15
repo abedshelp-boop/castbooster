@@ -5,6 +5,11 @@ import signal
 import sys
 
 from castbooster import __version__, wakelock
+from castbooster.ffmpeg_probe import (
+    detect as detect_ffmpeg,
+    FFmpegNotFoundError,
+    FFmpegProbeError,
+)
 from castbooster.log import LOG_PATH, setup_logging
 from castbooster.proxy import PROXY_PORT, start_proxy
 from castbooster.tray import run_tray
@@ -41,6 +46,21 @@ def main() -> int:
             PROXY_PORT,
         )
         return 0
+
+    # Pillar 2 — probe ffmpeg once at boot so later sub-tasks (transcoder,
+    # filter chain) can read the cached AccelProfile without re-running
+    # subprocess calls. Must NOT raise — Phase 1 passthrough cast still
+    # works without ffmpeg.
+    try:
+        accel = detect_ffmpeg()
+        log.info("ffmpeg ready: %s", accel)
+    except FFmpegNotFoundError as e:
+        log.error(
+            "ffmpeg missing — Pillar 2 transcode features disabled. "
+            "Run app\\scripts\\fetch_ffmpeg.ps1 to install. detail=%s", e,
+        )
+    except FFmpegProbeError as e:
+        log.error("ffmpeg probe failed — Pillar 2 transcode disabled. detail=%s", e)
 
     proxy = start_proxy(on_ready=lambda ip: log.info("proxy ready on LAN IP %s", ip))
     if not proxy.wait_ready(timeout=5.0):
