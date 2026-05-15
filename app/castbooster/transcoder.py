@@ -696,9 +696,11 @@ class Transcoder:
                 self._set_state_locked(self._aggregate_current_state_locked())
                 result = True
 
-        # Stop OLD outside the lock (rmtree is slow on Windows)
+        # Stop the discarded slot outside the lock (rmtree is slow on Windows).
+        # Demote / abort branches kill fast (NEW is failed or being torn down);
+        # promote keeps the full graceful drain so OLD can finish its in-flight segment.
         if next_to_stop is not None:
-            next_to_stop.stop()
+            next_to_stop.stop(drain_seconds=2.0 if result else 0.1)
         return result
 
 

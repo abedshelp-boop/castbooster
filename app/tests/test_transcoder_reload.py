@@ -232,3 +232,140 @@ def test_master_playlist_path_updates_on_promote(tmp_path, sw_profile, fake_pope
     finally:
         new_fake.set_exit(0)
         t.stop()
+
+
+# ---------- R6: demote on NEW warming timeout --------------------------------
+
+def test_reload_demotes_on_new_warming_timeout(tmp_path, sw_profile, fake_popen):
+    """NEW never reaches READY within warming_timeout → demote, return False."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        warming_timeout=0.3,      # tight: NEW will time out fast
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+
+        # Call set_filter_chain in foreground (it will block ~0.3s then return False)
+        result = t.set_filter_chain(FilterChain([NoopFilter()]))
+        assert result is False
+        # v1 still serving
+        assert t.output_dir == v1
+        # State back to a stable serving state
+        assert t.state in (TranscoderState.READY, TranscoderState.STREAMING, TranscoderState.STALLED)
+        # NEW's dir was cleaned up
+        assert not (tmp_path / "out" / "v2").exists()
+    finally:
+        old_fake.set_exit(0)
+        new_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- R7: demote on NEW fatal stderr -----------------------------------
+
+def test_reload_demotes_on_new_fatal_stderr(tmp_path, sw_profile, fake_popen):
+    """NEW emits a fatal stderr pattern → FAILED → demote, return False."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        warming_timeout=5.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+
+        # Kick off reload, then queue a fatal stderr line on NEW
+        result_q: queue.Queue = queue.Queue()
+
+        def call_reload():
+            r = t.set_filter_chain(FilterChain([NoopFilter()]))
+            result_q.put(r)
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.0)
+
+        # Fire the fatal stderr; NEW should go to FAILED, set_filter_chain returns False
+        new_fake.queue_stderr("Error opening encoder for h264 — generic encoder init failed")
+
+        result = result_q.get(timeout=2.0)
+        assert result is False
+        assert not (tmp_path / "out" / "v2").exists()
+        assert t.output_dir == v1
+    finally:
+        old_fake.set_exit(0)
+        new_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- R8: last_reload_error reflects inner idle_reason -----------------
+
+def test_reload_demotes_sets_last_reload_error(tmp_path, sw_profile, fake_popen):
+    """After demote via fatal stderr, last_reload_error matches the inner reason."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        warming_timeout=5.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+        assert t.last_reload_error is None
+
+        result_q: queue.Queue = queue.Queue()
+
+        def call_reload():
+            r = t.set_filter_chain(FilterChain([NoopFilter()]))
+            result_q.put(r)
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.0)
+
+        # Use the subtitle pattern (the one we added in Task 5) — exercises both
+        # the new fatal pattern and the demote path.
+        new_fake.queue_stderr(
+            "Stream specifier 's:0' in filtergraph description matches no streams."
+        )
+
+        result = result_q.get(timeout=2.0)
+        assert result is False
+        assert t.last_reload_error == "subtitle_stream_missing"
+    finally:
+        old_fake.set_exit(0)
+        new_fake.set_exit(0)
+        t.stop()
