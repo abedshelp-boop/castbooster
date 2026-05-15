@@ -201,6 +201,21 @@ class Transcoder:
         )
         self._stderr_thread.start()
 
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """Block until state reaches READY (returns True) or FAILED/timeout
+        (returns False). Default timeout = self.warming_timeout."""
+        if timeout is None:
+            timeout = self._warming_timeout
+        # _ready_event is set by _set_state_locked when entering READY or FAILED
+        signalled = self._ready_event.wait(timeout=timeout)
+        if not signalled:
+            return False
+        return self._state in (
+            TranscoderState.READY,
+            TranscoderState.STREAMING,
+            TranscoderState.STALLED,
+        )
+
     def stop(self, drain_seconds: float = 2.0) -> None:
         # Full lifecycle teardown lands in later tasks. Minimal no-op for now
         # so test setUps that call stop() in finally blocks don't crash.

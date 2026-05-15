@@ -585,3 +585,66 @@ def test_stalled_recovers_to_streaming(tmp_path, sw_profile):
                 f"state={t.state}"
         finally:
             t.stop()
+
+
+# ---------- wait_until_ready -------------------------------------------------
+
+def test_wait_until_ready_true_when_ready(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    out = tmp_path / "out"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=out,
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            # Have a background producer race against wait_until_ready
+            def produce():
+                time.sleep(0.1)
+                _touch_segment(out, 0); _touch_segment(out, 1); _touch_variant(out)
+            threading.Thread(target=produce, daemon=True).start()
+            assert t.wait_until_ready(timeout=2.0) is True
+            assert t.state in (TranscoderState.READY, TranscoderState.STREAMING)
+        finally:
+            t.stop()
+
+
+def test_wait_until_ready_false_on_failure(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            fake.queue_stderr("No NVENC capable devices found")
+            assert t.wait_until_ready(timeout=2.0) is False
+            assert t.state == TranscoderState.FAILED
+        finally:
+            t.stop()
+
+
+def test_wait_until_ready_false_on_timeout(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            warming_timeout=10.0,    # poller wouldn't trip in time
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert t.wait_until_ready(timeout=0.2) is False
+        finally:
+            t.stop()
