@@ -69,14 +69,14 @@ def test_subtitle_burnin_stream_index_2():
 
 
 def test_subtitle_burnin_escapes_windows_path():
-    """A Windows path with backslashes is wrapped in single quotes and
-    backslashes are doubled per ffmpeg filtergraph level-1 escape rules."""
+    """A Windows path is normalized to forward slashes; the drive-letter
+    colon is backslash-escaped to satisfy ffmpeg's AVOption parser."""
     from castbooster.filter_chain import SubtitleBurnIn
     stage = SubtitleBurnIn()
     stage._bind(r"C:\Users\Abeds\AppData\Local\Temp\castbooster\token\v1\input.mkv")
     expected = (
-        "subtitles='C:\\\\Users\\\\Abeds\\\\AppData\\\\Local\\\\Temp"
-        "\\\\castbooster\\\\token\\\\v1\\\\input.mkv':si=0"
+        "subtitles='C\\:/Users/Abeds/AppData/Local/Temp/"
+        "castbooster/token/v1/input.mkv':si=0"
     )
     assert stage.render() == expected
 

@@ -98,3 +98,82 @@ def test_reload_noop_to_noop_swap_with_lavfi(tmp_path):
         # Confirm cleanup
         assert not (base / "v1").exists()
         assert not (base / "v2").exists()
+
+
+def _build_subbed_mkv(
+    ffmpeg_path: str,
+    out_path: Path,
+    ass_path: Path,
+    duration_seconds: int = 30,
+) -> None:
+    """Build an mkv with embedded video + audio + subtitle streams via lavfi + .ass file."""
+    args = [
+        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", f"testsrc=size=320x240:rate=24:duration={duration_seconds}",
+        "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=44100:duration={duration_seconds}",
+        "-f", "ass", "-i", str(ass_path),
+        "-map", "0:v", "-map", "1:a", "-map", "2:s",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-c:a", "aac",
+        "-c:s", "ass",
+        str(out_path),
+    ]
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW
+    subprocess.run(args, check=True, creationflags=creationflags, timeout=60)
+
+
+def test_reload_noop_to_subtitleburnin_with_fixture(tmp_path):
+    """Spec §7.2 walkthrough. Build a 30s mkv with embedded subs, swap
+    NoopFilter → SubtitleBurnIn, confirm NEW slot reaches READY.
+
+    Visual-pixel-diff (subs actually visible) is out of scope for CI —
+    manual VLC verification is in spec §10 acceptance.
+    """
+    from castbooster.filter_chain import SubtitleBurnIn
+
+    accel = detect()
+    fixtures = Path(__file__).parent / "fixtures"
+    ass_path = fixtures / "sample.ass"
+    assert ass_path.exists(), f"missing fixture: {ass_path}"
+
+    src = tmp_path / "src.mkv"
+    _build_subbed_mkv(accel.ffmpeg_path, src, ass_path, duration_seconds=30)
+
+    base = tmp_path / "out"
+    t = Transcoder(
+        input_url=str(src),
+        base_output_dir=base,
+        accel=accel,
+        warming_timeout=8.0,
+        stall_timeout=8.0,
+        _poll_interval=0.1,
+    )
+    t.start()
+    try:
+        # OLD up
+        assert t.wait_until_ready(timeout=8.0), \
+            f"OLD never READY: state={t.state} reason={t.idle_reason}"
+
+        v1 = base / "v1"
+        v2 = base / "v2"
+        assert t.output_dir == v1
+
+        # Swap to SubtitleBurnIn
+        result = t.set_filter_chain(FilterChain([SubtitleBurnIn(stream_index=0)]))
+        assert result is True, (
+            f"reload to SubtitleBurnIn failed; "
+            f"state={t.state} last_reload_error={t.last_reload_error}"
+        )
+        assert t.state in (TranscoderState.READY, TranscoderState.STREAMING)
+        assert t.output_dir == v2
+        assert v2.exists()
+        # v2 has actual segment files (proof ffmpeg accepted the filter)
+        segs = sorted(v2.glob("seg_*.ts"))
+        assert len(segs) >= 2, f"expected ≥ 2 segments in v2, got {len(segs)}"
+        assert not v1.exists()
+    finally:
+        t.stop()
+        assert not (base / "v1").exists()
+        assert not (base / "v2").exists()

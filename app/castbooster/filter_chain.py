@@ -69,19 +69,24 @@ def _escape_for_subtitles_filter(path: str) -> str:
     """Escape a filesystem path for use inside ffmpeg's subtitles= filter argument.
 
     Strategy per ffmpeg-all docs (filtergraph escaping §32.1):
-      1. Wrap in single quotes — preserves ':', '=', ',' inside the option value.
-      2. Double any backslashes inside the quotes.
-      3. If the path contains a literal apostrophe, splice with '\\'' per the
+      1. Normalize backslashes to forward slashes — ffmpeg accepts forward
+         slashes on Windows AND it simplifies the escape rules.
+      2. Escape colons with backslash — ffmpeg uses ':' as AVOption separator
+         INSIDE a filter argument; the surrounding single quotes do NOT
+         protect option-value colons. Windows drive letters (C:) require this.
+      3. Wrap in single quotes — preserves ',' inside the option value.
+      4. If the path contains a literal apostrophe, splice with '\\'' per the
          ffmpeg example "Crime d'\\''Amour".
 
     Examples:
         /tmp/sample.mkv  →  '/tmp/sample.mkv'
-        C:\\foo\\bar.mkv  →  'C:\\\\foo\\\\bar.mkv'
+        C:\\foo\\bar.mkv  →  'C\\:/foo/bar.mkv'
         /x/Crime d'Amour.mkv  →  '/x/Crime d'\\''Amour.mkv'
     """
-    inner = path.replace("\\", "\\\\")
-    inner = inner.replace("'", "'\\''")
-    return f"'{inner}'"
+    path = path.replace("\\", "/")
+    path = path.replace(":", "\\:")
+    path = path.replace("'", "'\\''")
+    return f"'{path}'"
 
 
 class SubtitleBurnIn:
