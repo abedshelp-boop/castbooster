@@ -83,6 +83,8 @@ class Transcoder:
         self._poller_thread: Optional[threading.Thread] = None
         self._stop_requested = threading.Event()
         self._warming_started_monotonic: float = 0.0
+        self._last_seg_count: int = 0
+        self._last_new_seg_monotonic: float = 0.0
 
     @property
     def state(self) -> TranscoderState:
@@ -288,11 +290,23 @@ class Transcoder:
                                 idle_reason="warming_timed_out",
                             )
                     continue
-                ready, _ = self._is_ready_on_disk()
+                ready, seg_count = self._is_ready_on_disk()
                 if ready:
                     with self._state_lock:
                         if self._state == TranscoderState.WARMING:
                             self._set_state_locked(TranscoderState.READY)
+                            self._last_seg_count = seg_count
+                            self._last_new_seg_monotonic = time.monotonic()
+                    continue
+
+            if current == TranscoderState.READY:
+                _, seg_count = self._is_ready_on_disk()
+                if seg_count > self._last_seg_count:
+                    with self._state_lock:
+                        if self._state == TranscoderState.READY:
+                            self._set_state_locked(TranscoderState.STREAMING)
+                            self._last_seg_count = seg_count
+                            self._last_new_seg_monotonic = time.monotonic()
                     continue
 
     def _stderr_reader_loop(self) -> None:

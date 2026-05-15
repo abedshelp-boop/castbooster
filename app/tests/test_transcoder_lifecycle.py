@@ -501,3 +501,31 @@ def test_warming_to_failed_on_early_exit(tmp_path, sw_profile):
             assert t.exit_code == 1
         finally:
             t.stop()
+
+
+# ---------- READY -> STREAMING -----------------------------------------------
+
+def test_ready_to_streaming_on_new_seg(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    out = tmp_path / "out"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=out,
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            _touch_segment(out, 0)
+            _touch_segment(out, 1)
+            _touch_variant(out)
+            assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+            # Now a 3rd segment appears → STREAMING
+            _touch_segment(out, 2)
+            assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0), \
+                f"state={t.state}"
+        finally:
+            t.stop()
