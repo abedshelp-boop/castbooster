@@ -50,3 +50,41 @@ def parse_hwaccels(output: str) -> List[str]:
             continue
         out.append(s)
     return out
+
+
+def parse_encoders(output: str) -> List[str]:
+    """Parse `ffmpeg -encoders` stdout into a list of encoder names.
+
+    Format (canonical):
+        Encoders:
+         V..... = Video
+         A..... = Audio
+         ...
+         ------
+         V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)
+         V..... h264_qsv             H.264 / AVC / MPEG-4 AVC ...
+         ...
+    Each entry line has a 6-char flag block, then the encoder name, then
+    a free-form description. We only process lines AFTER the `------`
+    divider so the legend rows above it don't poison the result.
+    """
+    out: List[str] = []
+    in_table = False
+    for raw in (output or "").splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("------"):
+            in_table = True
+            continue
+        if not in_table or not stripped:
+            continue
+        parts = stripped.split(None, 2)
+        if len(parts) < 2:
+            continue
+        flags, name = parts[0], parts[1]
+        # Real flag blocks are exactly 6 chars and start with V/A/S.
+        if len(flags) != 6:
+            continue
+        if flags[0] not in ("V", "A", "S"):
+            continue
+        out.append(name)
+    return out
