@@ -369,3 +369,281 @@ def test_reload_demotes_sets_last_reload_error(tmp_path, sw_profile, fake_popen)
         old_fake.set_exit(0)
         new_fake.set_exit(0)
         t.stop()
+
+
+# ---------- R1: rejects in IDLE -----------------------------------------------
+
+def test_set_filter_chain_rejects_in_idle(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder
+    from castbooster.filter_chain import FilterChain, NoopFilter
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+    )
+    with pytest.raises(RuntimeError, match="state IDLE"):
+        t.set_filter_chain(FilterChain([NoopFilter()]))
+
+
+# ---------- R2: rejects in WARMING -------------------------------------------
+
+def test_set_filter_chain_rejects_in_warming(tmp_path, sw_profile, fake_popen):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+        with pytest.raises(RuntimeError, match="state WARMING"):
+            t.set_filter_chain(FilterChain([NoopFilter()]))
+    finally:
+        old_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- R3: rejects when reload already in progress ----------------------
+
+def test_set_filter_chain_rejects_when_reload_in_progress(tmp_path, sw_profile, fake_popen):
+    """While in RELOADING, a second set_filter_chain call raises."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+
+        def call_reload():
+            t.set_filter_chain(FilterChain([NoopFilter()]))
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.0)
+
+        # Second call must raise
+        with pytest.raises(RuntimeError, match="reload already in progress"):
+            t.set_filter_chain(FilterChain([NoopFilter()]))
+
+        # Let the first reload finish cleanly
+        v2 = tmp_path / "out" / "v2"
+        _make_ready(v2)
+        old_fake.set_exit(0)
+        th.join(timeout=2.0)
+    finally:
+        new_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- R5: promote rmtrees v1 -------------------------------------------
+
+def test_reload_promotes_kills_old_rmtrees_v1(tmp_path, sw_profile, fake_popen):
+    """Explicit check that successful reload removes v1 entirely."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        v2 = tmp_path / "out" / "v2"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+        assert v1.exists()
+
+        result_q: queue.Queue = queue.Queue()
+
+        def call_reload():
+            r = t.set_filter_chain(FilterChain([NoopFilter()]))
+            result_q.put(r)
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.0)
+        _make_ready(v2)
+        old_fake.set_exit(0)
+        assert result_q.get(timeout=2.0) is True
+        # v1 should be GONE
+        assert not v1.exists(), f"v1 survived promote: {list(v1.iterdir())}"
+        # v2 should exist + be _current
+        assert v2.exists()
+        assert t.output_dir == v2
+    finally:
+        new_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- R9: OLD dies mid-reload but NEW warms — promote anyway ----------
+
+def test_reload_state_stays_reloading_if_old_dies_but_new_warms(tmp_path, sw_profile, fake_popen):
+    """OLD set_exit(1) during RELOADING → state stays RELOADING.
+    NEW eventually reaches READY → promote → STREAMING/READY."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        warming_timeout=5.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+
+        result_q: queue.Queue = queue.Queue()
+
+        def call_reload():
+            r = t.set_filter_chain(FilterChain([NoopFilter()]))
+            result_q.put(r)
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.0)
+
+        # OLD dies with non-zero
+        old_fake.set_exit(1)
+        # State should stay RELOADING (NEW hasn't reached READY yet)
+        # Brief sleep to let the OLD poller observe the exit
+        time.sleep(0.2)
+        assert t.state == TranscoderState.RELOADING
+
+        # Now make NEW ready → promote
+        v2 = tmp_path / "out" / "v2"
+        _make_ready(v2)
+        assert result_q.get(timeout=2.0) is True
+        assert t.state in (TranscoderState.READY, TranscoderState.STREAMING)
+        assert t.output_dir == v2
+    finally:
+        new_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- R10: both OLD and NEW die — state = FAILED ----------------------
+
+def test_reload_failed_if_both_old_and_new_die(tmp_path, sw_profile, fake_popen):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        warming_timeout=1.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+
+        result_q: queue.Queue = queue.Queue()
+
+        def call_reload():
+            r = t.set_filter_chain(FilterChain([NoopFilter()]))
+            result_q.put(r)
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.0)
+
+        # Both die
+        old_fake.set_exit(1)
+        new_fake.set_exit(1)
+
+        result = result_q.get(timeout=2.0)
+        assert result is False
+        # NEW also died — state goes FAILED because _current died (OLD) and _next failed (NEW)
+        # The aggregation chooses FAILED when _current.sub_state == FAILED
+        assert _wait_for_state(t, TranscoderState.FAILED, timeout=2.0)
+    finally:
+        t.stop()
+
+
+# ---------- R11: stop() during RELOADING cleans both slots -------------------
+
+def test_stop_during_reloading_cleans_up_both_slots(tmp_path, sw_profile, fake_popen):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        warming_timeout=10.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        v2 = tmp_path / "out" / "v2"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+
+        def call_reload():
+            try:
+                t.set_filter_chain(FilterChain([NoopFilter()]))
+            except Exception:
+                pass
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.0)
+
+        # NEW never gets made ready — instead we call stop()
+        old_fake.set_exit(0)    # ensure stop()'s drains return promptly
+        new_fake.set_exit(0)
+        t.stop()
+
+        assert t.state == TranscoderState.TERMINATED
+        assert not v1.exists(), f"v1 survived stop(): exists"
+        assert not v2.exists(), f"v2 survived stop(): exists"
+        th.join(timeout=2.0)
+    finally:
+        # If anything is still alive, force-cleanup
+        if t.state != TranscoderState.TERMINATED:
+            t.stop()

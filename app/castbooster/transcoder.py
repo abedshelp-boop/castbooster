@@ -164,7 +164,19 @@ class _ProcessSlot:
         (self._output_dir / "master.m3u8").write_text(_MASTER_PLAYLIST, encoding="utf-8")
 
     def start(self, argv: list[str]) -> None:
+        # Guard: if stop() was called before start() (race during RELOADING teardown),
+        # skip directory creation and process spawn entirely.  The slot is already
+        # TERMINATING/TERMINATED and its output_dir was (or will be) cleaned up by stop().
+        with self._sub_state_lock:
+            if self._sub_state in (_SlotState.TERMINATING, _SlotState.TERMINATED):
+                return
         self._write_master_playlist()
+        # Second guard after mkdir: stop() may have completed _cleanup_output_dir()
+        # between the check above and the mkdir.  If so, remove the freshly-created
+        # directory ourselves so stop()'s cleanup is not undone.
+        if self._stop_requested.is_set():
+            self._cleanup_output_dir()
+            return
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NO_WINDOW
@@ -662,10 +674,15 @@ class Transcoder:
             hls_segment_seconds=self._hls_segment_seconds,
             vf_fragment=chain.render(self._input_url),
         )
-        self._next.start(argv)
+        # Capture a local reference: stop() may null self._next concurrently.
+        # _ProcessSlot.start() is guarded so it won't create output_dir if the
+        # slot has already been stopped.
+        next_slot_local: _ProcessSlot = self._next  # type: ignore[assignment]
+        next_slot_local.start(argv)
 
-        # Block until NEW reaches READY or FAILED (or timeout)
-        promoted = self._next.wait_until_ready(timeout=self._warming_timeout)
+        # Block until NEW reaches READY or FAILED (or timeout).
+        # Use the local reference — stop() may have set self._next to None.
+        promoted = next_slot_local.wait_until_ready(timeout=self._warming_timeout)
 
         next_to_stop: Optional[_ProcessSlot] = None
         result: bool = False
