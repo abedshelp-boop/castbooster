@@ -263,3 +263,50 @@ def test_master_playlist_written_on_start(tmp_path, sw_profile):
             assert contents.rstrip().endswith("variant.m3u8")
         finally:
             t.stop()
+
+
+# ---------- start() lifecycle ------------------------------------------------
+
+def test_start_transitions_to_warming(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake) as popen_mock:
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            # Give the poller one tick to advance SPAWNING → WARMING
+            time.sleep(0.1)
+            assert t.state == TranscoderState.WARMING
+            assert popen_mock.call_count == 1
+            # Verify Popen was called with our argv
+            args = popen_mock.call_args.args[0]
+            assert args[0] == sw_profile.ffmpeg_path
+            # stdin=PIPE, stderr=PIPE so we can drain on stop + read errors
+            kwargs = popen_mock.call_args.kwargs
+            assert kwargs["stdin"] == subprocess.PIPE
+            assert kwargs["stderr"] == subprocess.PIPE
+        finally:
+            t.stop()
+
+
+def test_start_raises_when_called_twice(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            with pytest.raises(RuntimeError):
+                t.start()
+        finally:
+            t.stop()

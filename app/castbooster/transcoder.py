@@ -22,8 +22,11 @@ FAILED so wait_until_ready() can block on it cleanly.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import sys
 import threading
+import time
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -72,6 +75,13 @@ class Transcoder:
         self._state: TranscoderState = TranscoderState.IDLE
         self._idle_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
+        self._state_lock = threading.Lock()
+        self._ready_event = threading.Event()
+        self._process: Optional[subprocess.Popen] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._poller_thread: Optional[threading.Thread] = None
+        self._stop_requested = threading.Event()
+        self._warming_started_monotonic: float = 0.0
 
     @property
     def state(self) -> TranscoderState:
@@ -121,6 +131,25 @@ class Transcoder:
         ]
         return argv
 
+    def _set_state_locked(
+        self,
+        new_state: TranscoderState,
+        idle_reason: Optional[str] = None,
+    ) -> None:
+        """Caller MUST hold self._state_lock."""
+        if self._state == new_state:
+            return
+        log.info(
+            "transcoder state: %s -> %s%s",
+            self._state.name, new_state.name,
+            f" ({idle_reason})" if idle_reason else "",
+        )
+        self._state = new_state
+        if idle_reason is not None and self._idle_reason is None:
+            self._idle_reason = idle_reason
+        if new_state in (TranscoderState.READY, TranscoderState.FAILED):
+            self._ready_event.set()
+
     def _write_master_playlist(self) -> None:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         (self._output_dir / "master.m3u8").write_text(
@@ -128,19 +157,67 @@ class Transcoder:
         )
 
     def start(self) -> None:
-        if self._state != TranscoderState.IDLE:
-            raise RuntimeError(
-                f"start() called in state {self._state.name}; expected IDLE"
-            )
+        with self._state_lock:
+            if self._state != TranscoderState.IDLE:
+                raise RuntimeError(
+                    f"start() called in state {self._state.name}; expected IDLE"
+                )
+            self._set_state_locked(TranscoderState.SPAWNING)
+
         self._write_master_playlist()
-        # Full Popen + thread spawn lands in Task 5. For now just transition
-        # to SPAWNING so the test in Task 4 can validate the playlist.
-        self._state = TranscoderState.SPAWNING
+
+        argv = self._build_argv()
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NO_WINDOW
+        log.info("transcoder spawning: %s", " ".join(argv[:6]) + " ...")
+        self._process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        self._warming_started_monotonic = time.monotonic()
+
+        with self._state_lock:
+            self._set_state_locked(TranscoderState.WARMING)
+
+        # Threads land in Tasks 7 + 8. For now spawn the poller thread as a
+        # bare loop so the state visibly remains WARMING in tests.
+        self._poller_thread = threading.Thread(
+            target=self._watchdog_poller_loop,
+            name=f"transcoder-poller-{id(self):x}",
+            daemon=True,
+        )
+        self._poller_thread.start()
+        self._stderr_thread = threading.Thread(
+            target=self._stderr_reader_loop,
+            name=f"transcoder-stderr-{id(self):x}",
+            daemon=True,
+        )
+        self._stderr_thread.start()
 
     def stop(self, drain_seconds: float = 2.0) -> None:
         # Full lifecycle teardown lands in later tasks. Minimal no-op for now
         # so test setUps that call stop() in finally blocks don't crash.
+        self._stop_requested.set()
         self._state = TranscoderState.TERMINATED
+
+    def _watchdog_poller_loop(self) -> None:
+        """Filled out in Task 8 (READY detection) + Task 9 (timeout) +
+        Task 10 (early-exit) + Tasks 11–12 (STREAMING/STALLED)."""
+        while not self._stop_requested.is_set():
+            time.sleep(self._poll_interval)
+
+    def _stderr_reader_loop(self) -> None:
+        """Filled out in Task 7 (FAILED via stderr pattern)."""
+        try:
+            for raw_line in self._process.stderr:  # type: ignore[union-attr]
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                log.debug("ffmpeg stderr: %s", line)
+        except Exception:
+            log.exception("stderr reader crashed")
 
 
 # Per-encoder flags. Values verified against current ffmpeg HLS muxer +
