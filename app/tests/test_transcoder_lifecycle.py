@@ -279,7 +279,10 @@ def test_start_transitions_to_warming(tmp_path, sw_profile):
         )
         t.start()
         try:
-            # Give the poller one tick to advance SPAWNING → WARMING
+            # WARMING is set synchronously in start() before threads launch.
+            # Sleep here gives the daemon threads time to be scheduled so
+            # stop() in the finally block finds them alive (relevant once
+            # later rounds add thread.join() to stop()).
             time.sleep(0.1)
             assert t.state == TranscoderState.WARMING
             assert popen_mock.call_count == 1

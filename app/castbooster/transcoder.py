@@ -202,7 +202,8 @@ class Transcoder:
         # Full lifecycle teardown lands in later tasks. Minimal no-op for now
         # so test setUps that call stop() in finally blocks don't crash.
         self._stop_requested.set()
-        self._state = TranscoderState.TERMINATED
+        with self._state_lock:
+            self._set_state_locked(TranscoderState.TERMINATED)
 
     def _watchdog_poller_loop(self) -> None:
         """Filled out in Task 8 (READY detection) + Task 9 (timeout) +
