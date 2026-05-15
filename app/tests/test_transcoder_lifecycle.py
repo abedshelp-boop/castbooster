@@ -454,3 +454,25 @@ def test_warming_to_ready_when_files_appear(tmp_path, sw_profile):
                 f"state={t.state}"
         finally:
             t.stop()
+
+
+# ---------- WARMING -> FAILED on timeout -------------------------------------
+
+def test_warming_to_failed_on_timeout(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            warming_timeout=0.2,    # tight: fail fast
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.FAILED, timeout=1.0), \
+                f"state={t.state}"
+            assert t.idle_reason == "warming_timed_out"
+        finally:
+            t.stop()

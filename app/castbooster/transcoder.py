@@ -239,6 +239,19 @@ class Transcoder:
                 return
 
             if current == TranscoderState.WARMING:
+                # Check timeout BEFORE readiness so a slow upstream that takes
+                # >warming_timeout to produce 2 segs trips FAILED, not READY.
+                if (
+                    time.monotonic() - self._warming_started_monotonic
+                    > self._warming_timeout
+                ):
+                    with self._state_lock:
+                        if self._state == TranscoderState.WARMING:
+                            self._set_state_locked(
+                                TranscoderState.FAILED,
+                                idle_reason="warming_timed_out",
+                            )
+                    continue
                 ready, _ = self._is_ready_on_disk()
                 if ready:
                     with self._state_lock:
