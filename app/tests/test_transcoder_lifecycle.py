@@ -117,3 +117,39 @@ def test_fake_ffmpeg_wait_times_out_when_not_exited():
     fake = FakeFfmpegProcess()
     with pytest.raises(subprocess.TimeoutExpired):
         fake.wait(timeout=0.05)
+
+
+# ---------- Test fixtures + helpers ------------------------------------------
+
+from castbooster.ffmpeg_probe import AccelProfile
+
+
+def make_sw_profile() -> AccelProfile:
+    return AccelProfile(
+        ffmpeg_path="C:/fake/ffmpeg.exe",
+        encoder="libx264",
+        decoder="d3d11va",
+        tier="sw",
+        available_encoders=["libx264"],
+        available_hwaccels=["d3d11va"],
+        ffmpeg_version="8.1-test",
+    )
+
+
+@pytest.fixture
+def sw_profile():
+    return make_sw_profile()
+
+
+# ---------- Construction / IDLE ----------------------------------------------
+
+def test_initial_state_is_idle(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    t = Transcoder(
+        input_url="http://example.local/master.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+    )
+    assert t.state == TranscoderState.IDLE
+    assert t.idle_reason is None
+    assert t.exit_code is None
