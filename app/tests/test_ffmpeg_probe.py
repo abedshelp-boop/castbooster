@@ -1,5 +1,7 @@
 """Unit tests for castbooster.ffmpeg_probe."""
+import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -105,3 +107,41 @@ def test_locate_raises_when_nothing_found(monkeypatch, tmp_path):
     monkeypatch.setattr(ffmpeg_probe.shutil, "which", lambda _: None)
     with pytest.raises(ffmpeg_probe.FFmpegNotFoundError):
         ffmpeg_probe.locate_ffmpeg()
+
+
+def _completed(returncode: int, stdout: str = "", stderr: str = ""):
+    """Build a CompletedProcess-shaped MagicMock for monkeypatching _run."""
+    m = MagicMock()
+    m.returncode = returncode
+    m.stdout = stdout
+    m.stderr = stderr
+    return m
+
+
+def test_try_encoder_returns_true_on_success(monkeypatch):
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run", lambda args, timeout: _completed(0)
+    )
+    assert ffmpeg_probe.try_encoder("ffmpeg.exe", "libx264") is True
+
+
+def test_try_encoder_returns_false_on_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, timeout: _completed(1, stderr="no NVIDIA driver"),
+    )
+    assert ffmpeg_probe.try_encoder("ffmpeg.exe", "h264_nvenc") is False
+
+
+def test_try_encoder_returns_false_on_timeout(monkeypatch):
+    def _raise(*_a, **_kw):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5)
+    monkeypatch.setattr(ffmpeg_probe, "_run", _raise)
+    assert ffmpeg_probe.try_encoder("ffmpeg.exe", "h264_qsv") is False
+
+
+def test_try_encoder_returns_false_on_unexpected_exception(monkeypatch):
+    def _raise(*_a, **_kw):
+        raise OSError("file not found")
+    monkeypatch.setattr(ffmpeg_probe, "_run", _raise)
+    assert ffmpeg_probe.try_encoder("ffmpeg.exe", "libx264") is False

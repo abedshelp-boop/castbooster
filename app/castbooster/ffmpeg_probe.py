@@ -129,3 +129,52 @@ def locate_ffmpeg(override: Optional[str] = None) -> str:
         f"ffmpeg not found. Tried: {candidates}. "
         f"Run app/scripts/fetch_ffmpeg.ps1 to download it."
     )
+
+
+_PROBE_TIMEOUT = 5.0  # seconds per encoder probe
+
+
+def _run(args: List[str], *, timeout: float) -> subprocess.CompletedProcess:
+    """subprocess.run wrapper that suppresses the flashing console window on
+    Windows and always captures both stdout and stderr as text."""
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=creationflags,
+    )
+
+
+def try_encoder(ffmpeg_path: str, encoder: str) -> bool:
+    """Run a tiny encode-then-discard test. Returns True iff ffmpeg exits 0.
+
+    Why we do this instead of trusting `-encoders` enumeration: ffmpeg lists
+    encoders that compile-time exist but fail at runtime — e.g. it lists
+    h264_nvenc even on a machine with no NVIDIA driver. The only way to know
+    an encoder REALLY works is to actually try one frame.
+    """
+    args = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=size=64x64:rate=1:duration=0.1",
+        "-c:v", encoder, "-t", "0.05",
+        "-f", "null", "-",
+    ]
+    try:
+        result = _run(args, timeout=_PROBE_TIMEOUT)
+        if result.returncode != 0:
+            log.info(
+                "encoder %s runtime probe failed (exit=%d): %s",
+                encoder, result.returncode, (result.stderr or "")[:200],
+            )
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log.warning("encoder %s timed out after %ss", encoder, _PROBE_TIMEOUT)
+        return False
+    except Exception:
+        log.exception("encoder %s probe crashed", encoder)
+        return False
