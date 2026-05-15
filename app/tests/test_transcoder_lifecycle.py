@@ -510,6 +510,39 @@ def test_warming_to_failed_on_early_exit(tmp_path, sw_profile):
             t.stop()
 
 
+# ---------- WARMING -> READY via clean exit with files -----------------------
+
+def test_warming_to_ready_on_clean_exit_with_files(tmp_path, sw_profile):
+    """Fast finite source: ffmpeg writes all segments + exits 0 before the poller
+    observes intermediate state. The clean-exit-with-files branch in
+    _check_process_exit_locked promotes WARMING→READY instead of FAILED."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    out = tmp_path / "out"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=out,
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            # Simulate the race: files appear AND subprocess exits 0
+            # before the poller's next tick.
+            _touch_segment(out, 0)
+            _touch_segment(out, 1)
+            _touch_variant(out)
+            fake.set_exit(0)
+            assert _wait_for_state(t, TranscoderState.READY, timeout=1.0), \
+                f"state={t.state} reason={t.idle_reason}"
+            assert t.exit_code == 0
+            assert t.idle_reason is None
+        finally:
+            t.stop()
+
+
 # ---------- READY -> STREAMING -----------------------------------------------
 
 def test_ready_to_streaming_on_new_seg(tmp_path, sw_profile):
