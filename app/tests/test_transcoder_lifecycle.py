@@ -237,3 +237,29 @@ def test_command_segment_paths_under_output_dir(tmp_path, sw_profile):
     seg_idx = argv.index("-hls_segment_filename")
     assert str(out / "seg_%05d.ts") == argv[seg_idx + 1]
     assert str(out / "variant.m3u8") == argv[-1]
+
+
+# ---------- Master playlist --------------------------------------------------
+
+def test_master_playlist_written_on_start(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            master = tmp_path / "out" / "master.m3u8"
+            assert master.exists()
+            contents = master.read_text(encoding="utf-8")
+            assert contents.startswith("#EXTM3U")
+            assert "#EXT-X-VERSION:3" in contents
+            assert "BANDWIDTH=3000000" in contents
+            assert "RESOLUTION=1280x720" in contents
+            assert contents.rstrip().endswith("variant.m3u8")
+        finally:
+            t.stop()

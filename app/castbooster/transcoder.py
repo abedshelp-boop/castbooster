@@ -22,6 +22,8 @@ FAILED so wait_until_ready() can block on it cleanly.
 from __future__ import annotations
 
 import logging
+import subprocess
+import threading
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -119,6 +121,27 @@ class Transcoder:
         ]
         return argv
 
+    def _write_master_playlist(self) -> None:
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        (self._output_dir / "master.m3u8").write_text(
+            _MASTER_PLAYLIST, encoding="utf-8"
+        )
+
+    def start(self) -> None:
+        if self._state != TranscoderState.IDLE:
+            raise RuntimeError(
+                f"start() called in state {self._state.name}; expected IDLE"
+            )
+        self._write_master_playlist()
+        # Full Popen + thread spawn lands in Task 5. For now just transition
+        # to SPAWNING so the test in Task 4 can validate the playlist.
+        self._state = TranscoderState.SPAWNING
+
+    def stop(self, drain_seconds: float = 2.0) -> None:
+        # Full lifecycle teardown lands in later tasks. Minimal no-op for now
+        # so test setUps that call stop() in finally blocks don't crash.
+        self._state = TranscoderState.TERMINATED
+
 
 # Per-encoder flags. Values verified against current ffmpeg HLS muxer +
 # encoder docs at start of P2.2 implementation session (per CLAUDE.md rule
@@ -149,3 +172,11 @@ _ENCODER_FLAGS = {
         "-b:v", "3M",
     ],
 }
+
+_MASTER_PLAYLIST = (
+    "#EXTM3U\n"
+    "#EXT-X-VERSION:3\n"
+    "#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,"
+    'CODECS="avc1.4d401f,mp4a.40.2"\n'
+    "variant.m3u8\n"
+)
