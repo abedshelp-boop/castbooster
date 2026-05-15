@@ -41,7 +41,13 @@ class _FakeStderr:
         return self
 
     def __next__(self) -> bytes:
-        item = self._q.get()  # blocks
+        try:
+            item = self._q.get(timeout=30.0)
+        except queue.Empty:
+            raise RuntimeError(
+                "_FakeStderr blocked >30s with no item — "
+                "test forgot to call FakeFfmpegProcess.set_exit() or .queue_stderr()"
+            ) from None
         if item is self._SENTINEL:
             raise StopIteration
         assert isinstance(item, bytes)
@@ -70,9 +76,6 @@ class FakeFfmpegProcess:
 
     def kill(self) -> None:
         self.set_exit(-9)
-
-    def terminate(self) -> None:  # included for API parity; not used
-        self.set_exit(-15)
 
     # --- Test-driver surface ---
     def set_exit(self, code: int) -> None:
@@ -170,15 +173,19 @@ def test_command_uses_libx264_flags_for_sw_tier(tmp_path, sw_profile):
     enc_idx = argv.index("-c:v")
     assert argv[enc_idx + 1] == "libx264"
     # libx264-specific flags from the spec table
-    assert "-preset" in argv and "veryfast" in argv
-    assert "-tune" in argv and "zerolatency" in argv
-    assert "-pix_fmt" in argv and "yuv420p" in argv
-    # Common flags
-    assert "-vf" in argv and "null" in argv
-    assert "-c:a" in argv and "copy" in argv
-    assert "-hls_time" in argv and "2" in argv
-    assert "-hls_list_size" in argv and "6" in argv
-    assert "-f" in argv and "hls" in argv
+    def assert_adjacent(flag: str, value: str) -> None:
+        idx = argv.index(flag)
+        assert argv[idx + 1] == value, (
+            f"{flag} should be followed by {value!r}, got {argv[idx + 1]!r}"
+        )
+    assert_adjacent("-preset", "veryfast")
+    assert_adjacent("-tune", "zerolatency")
+    assert_adjacent("-pix_fmt", "yuv420p")
+    assert_adjacent("-vf", "null")
+    assert_adjacent("-c:a", "copy")
+    assert_adjacent("-hls_time", "2")
+    assert_adjacent("-hls_list_size", "6")
+    assert_adjacent("-f", "hls")
     # Input URL passed through
     assert "http://x/m.m3u8" in argv
 
@@ -212,8 +219,10 @@ def test_command_includes_hwaccel_when_decoder_available(tmp_path, sw_profile):
     enc_idx = argv.index("-c:v")
     assert argv[enc_idx + 1] == "h264_nvenc"
     # nvenc-specific flags from the spec table
-    assert "-preset" in argv and "p5" in argv
-    assert "-rc" in argv and "cbr" in argv
+    preset_idx = argv.index("-preset")
+    assert argv[preset_idx + 1] == "p5"
+    rc_idx = argv.index("-rc")
+    assert argv[rc_idx + 1] == "cbr"
 
 
 def test_command_segment_paths_under_output_dir(tmp_path, sw_profile):
