@@ -124,6 +124,14 @@ class Transcoder:
             "-c:v", self._accel.encoder,
         ]
         argv += _ENCODER_FLAGS.get(self._accel.encoder, [])
+        # Force a keyframe at each HLS segment boundary so the muxer can always
+        # split at the correct time. Without this, zerolatency / HW encoders may
+        # not produce keyframes at the right interval and the HLS muxer folds all
+        # content into one segment when independent_segments is set.
+        argv += [
+            "-force_key_frames",
+            f"expr:gte(t,n_forced*{self._hls_segment_seconds})",
+        ]
         argv += [
             "-c:a", "copy",
             "-f", "hls",
@@ -302,12 +310,26 @@ class Transcoder:
         code = self._process.poll()
         if code is None:
             return False
+        # If ffmpeg exited cleanly, do a final filesystem check before declaring
+        # failure — a fast finite source (e.g., a lavfi test file) may write all
+        # segments and exit before the watchdog's next poll. Do this outside the
+        # lock since _is_ready_on_disk only touches the filesystem.
+        final_ready = False
+        final_seg_count = 0
+        if code == 0:
+            final_ready, final_seg_count = self._is_ready_on_disk()
         with self._state_lock:
             self._exit_code = code
             if self._state in (
                 TranscoderState.SPAWNING,
                 TranscoderState.WARMING,
             ):
+                if final_ready:
+                    # ffmpeg wrote all output and exited cleanly → treat as READY
+                    self._set_state_locked(TranscoderState.READY)
+                    self._last_seg_count = final_seg_count
+                    self._last_new_seg_monotonic = time.monotonic()
+                    return False  # not a failure
                 self._set_state_locked(
                     TranscoderState.FAILED,
                     idle_reason="subprocess_died_early",
