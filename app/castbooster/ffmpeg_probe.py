@@ -88,3 +88,44 @@ def parse_encoders(output: str) -> List[str]:
             continue
         out.append(name)
     return out
+
+
+class FFmpegNotFoundError(RuntimeError):
+    """No ffmpeg binary could be located via override, env, bundled, or PATH."""
+
+
+class FFmpegProbeError(RuntimeError):
+    """ffmpeg was located but every H.264 encoder probe failed (libx264 included).
+
+    This should be impossible in practice — libx264 has no hardware dependency.
+    Seeing this typically means the vendored binary is corrupt or being blocked
+    by AV / EDR.
+    """
+
+
+_BUNDLED_FFMPEG = Path(__file__).parent / "bin" / "ffmpeg.exe"
+
+
+def locate_ffmpeg(override: Optional[str] = None) -> str:
+    """Find ffmpeg in priority order: override arg, env, bundled, PATH.
+
+    Returns the absolute path. Raises FFmpegNotFoundError if none of the
+    candidates point at a real file.
+    """
+    candidates: List[Optional[str]] = []
+    if override:
+        candidates.append(override)
+    env = os.environ.get("CASTBOOSTER_FFMPEG")
+    if env:
+        candidates.append(env)
+    candidates.append(str(_BUNDLED_FFMPEG))
+    path_lookup = shutil.which("ffmpeg")
+    if path_lookup:
+        candidates.append(path_lookup)
+    for c in candidates:
+        if c and Path(c).is_file():
+            return str(Path(c).resolve())
+    raise FFmpegNotFoundError(
+        f"ffmpeg not found. Tried: {candidates}. "
+        f"Run app/scripts/fetch_ffmpeg.ps1 to download it."
+    )
