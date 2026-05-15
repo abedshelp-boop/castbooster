@@ -187,6 +187,7 @@ def test_output_dir_still_points_at_v1_during_reloading(tmp_path, sw_profile, fa
         _make_ready(v2)
         old_fake.set_exit(0)
         th.join(timeout=2.0)
+        assert not th.is_alive(), "reload thread did not finish in time"
     finally:
         new_fake.set_exit(0)
         t.stop()
@@ -225,6 +226,7 @@ def test_master_playlist_path_updates_on_promote(tmp_path, sw_profile, fake_pope
         _make_ready(v2)
         old_fake.set_exit(0)
         th.join(timeout=2.0)
+        assert not th.is_alive(), "reload thread did not finish in time"
 
         assert t.master_playlist == v2 / "master.m3u8"
     finally:

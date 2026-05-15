@@ -208,6 +208,7 @@ class _ProcessSlot:
                 return
             self._set_sub_state_locked(_SlotState.TERMINATING)
         self._stop_requested.set()
+        self._ready_event.set()        # unblock any wait_until_ready() waiters promptly
         if self._process is not None:
             try:
                 if self._process.stdin is not None:
@@ -541,13 +542,16 @@ class Transcoder:
             if self._state in (TranscoderState.TERMINATING, TranscoderState.TERMINATED):
                 return
             self._set_state_locked(TranscoderState.TERMINATING)
-        # Stop _next first if it exists (Task 6+); always stop _current
-        next_slot = self._next
+            # Snapshot refs under the lock to avoid a data race with set_filter_chain
+            # writing self._next outside the lock during its wait_until_ready() call.
+            next_slot = self._next
+            current_slot = self._current
+            self._next = None
+        # Stop NEW first if it exists (Task 6+); always stop _current
         if next_slot is not None:
             next_slot.stop(drain_seconds=drain_seconds)
-            self._next = None
-        if self._current is not None:
-            self._current.stop(drain_seconds=drain_seconds)
+        if current_slot is not None:
+            current_slot.stop(drain_seconds=drain_seconds)
         with self._state_lock:
             self._set_state_locked(TranscoderState.TERMINATED)
 
