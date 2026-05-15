@@ -4,25 +4,27 @@ State machine (every observable state is enumerated; no predicate ever
 treats "not active" as "done" — see 2026-04-22 IDLE-race lesson):
 
     IDLE         constructed; start() not yet called
-    SPAWNING     Popen returned; pipes open; no log line yet
-    WARMING      ffmpeg running; output files not yet present
-    READY        >= 2 seg_*.ts + master.m3u8 + variant.m3u8 on disk
-    STREAMING    new segment appeared after READY (cadence healthy)
-    STALLED      STREAMING but no new seg for stall_timeout seconds
-    FAILED       subprocess exited non-zero OR stderr matched fatal pattern
-                 OR warming_timeout elapsed pre-READY
-    TERMINATING  stop() called; q\\n sent to stdin; draining
-    TERMINATED   subprocess reaped + output_dir deleted
+    SPAWNING     _current slot in SPAWNING
+    WARMING      _current slot in WARMING
+    READY        _current slot in READY                            (Chromecast can fetch)
+    STREAMING    _current slot in STREAMING                        (Chromecast can fetch)
+    STALLED      _current slot in STALLED                          (Chromecast can fetch)
+    RELOADING    _current STREAMING/STALLED/READY + _next WARMING  (Chromecast can fetch from _current)
+    FAILED       _current FAILED + _next is None or also FAILED
+    TERMINATING  stop() called; draining both slots
+    TERMINATED   all slots reaped + output dirs deleted
 
-Threading: one stderr-reader thread + one watchdog-poller thread per
-Transcoder instance. State mutations go through _set_state_locked() under
-_state_lock. _ready_event is set the first time state becomes READY or
-FAILED so wait_until_ready() can block on it cleanly.
+Threading: each _ProcessSlot owns one stderr-reader thread + one
+watchdog-poller thread. Transcoder owns the state lock and the slot refs.
+State mutations go through _set_state_locked() under _state_lock.
+
+P2.3 added set_filter_chain(chain) -> bool for hot-reload via
+spawn-new-then-kill-old. RELOADING covers the window where NEW is
+WARMING in <base>/v<N+1>/ while OLD continues serving from <base>/v<N>/.
 """
 from __future__ import annotations
 
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -31,15 +33,16 @@ import threading
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from castbooster.ffmpeg_probe import AccelProfile
+from castbooster.filter_chain import FilterChain, NoopFilter
 
 log = logging.getLogger(__name__)
 
 
-class TranscoderState(Enum):
-    IDLE = "idle"
+class _SlotState(Enum):
+    """Per-process sub-state. Module-private; not part of public API."""
     SPAWNING = "spawning"
     WARMING = "warming"
     READY = "ready"
@@ -50,34 +53,82 @@ class TranscoderState(Enum):
     TERMINATED = "terminated"
 
 
-class Transcoder:
-    """Manages one ffmpeg subprocess that re-segments an input HLS source.
+class TranscoderState(Enum):
+    IDLE = "idle"
+    SPAWNING = "spawning"
+    WARMING = "warming"
+    READY = "ready"
+    STREAMING = "streaming"
+    STALLED = "stalled"
+    RELOADING = "reloading"
+    FAILED = "failed"
+    TERMINATING = "terminating"
+    TERMINATED = "terminated"
 
-    See module docstring for the full state-machine contract.
+
+def _build_argv(
+    input_url: str,
+    output_dir: Path,
+    accel: AccelProfile,
+    hls_segment_seconds: int,
+    vf_fragment: str = "null",                 # P2.3 Task 3 wires in filter_chain.render()
+) -> list[str]:
+    argv: list[str] = [
+        accel.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel", "info",
+        "-nostdin",
+    ]
+    if accel.decoder and accel.decoder != "none":
+        argv += ["-hwaccel", accel.decoder]
+    argv += [
+        "-fflags", "+genpts",
+        "-i", input_url,
+        "-vf", vf_fragment,
+        "-c:v", accel.encoder,
+    ]
+    argv += _ENCODER_FLAGS.get(accel.encoder, [])
+    argv += [
+        "-force_key_frames",
+        f"expr:gte(t,n_forced*{hls_segment_seconds})",
+    ]
+    argv += [
+        "-c:a", "copy",
+        "-f", "hls",
+        "-hls_time", str(hls_segment_seconds),
+        "-hls_list_size", "6",
+        "-hls_flags", "delete_segments+append_list+independent_segments",
+        "-hls_segment_filename", str(output_dir / "seg_%05d.ts"),
+        str(output_dir / "variant.m3u8"),
+    ]
+    return argv
+
+
+class _ProcessSlot:
+    """One ffmpeg subprocess + its threads + its output_dir + its sub-state.
+
+    Drives its own sub_state via internal threads; surfaces changes via the
+    on_sub_state_change callback so Transcoder can update aggregate state.
     """
 
     def __init__(
         self,
-        input_url: str,
         output_dir: Path,
-        accel: AccelProfile,
-        warming_timeout: float = 8.0,
-        stall_timeout: float = 8.0,
-        hls_segment_seconds: int = 2,
-        _poll_interval: float = 0.25,
+        warming_timeout: float,
+        stall_timeout: float,
+        poll_interval: float,
+        on_sub_state_change: Callable[["_ProcessSlot", "_SlotState"], None],
     ) -> None:
-        self._input_url = input_url
         self._output_dir = Path(output_dir)
-        self._accel = accel
         self._warming_timeout = warming_timeout
         self._stall_timeout = stall_timeout
-        self._hls_segment_seconds = hls_segment_seconds
-        self._poll_interval = _poll_interval
+        self._poll_interval = poll_interval
+        self._on_sub_state_change = on_sub_state_change
 
-        self._state: TranscoderState = TranscoderState.IDLE
+        self._sub_state: _SlotState = _SlotState.SPAWNING
         self._idle_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
-        self._state_lock = threading.Lock()
+        self._sub_state_lock = threading.Lock()
         self._ready_event = threading.Event()
         self._process: Optional[subprocess.Popen] = None
         self._stderr_thread: Optional[threading.Thread] = None
@@ -87,9 +138,14 @@ class Transcoder:
         self._last_seg_count: int = 0
         self._last_new_seg_monotonic: float = 0.0
 
+    # ---- properties ----
     @property
-    def state(self) -> TranscoderState:
-        return self._state
+    def output_dir(self) -> Path:
+        return self._output_dir
+
+    @property
+    def sub_state(self) -> _SlotState:
+        return self._sub_state
 
     @property
     def idle_reason(self) -> Optional[str]:
@@ -100,89 +156,32 @@ class Transcoder:
         return self._exit_code
 
     @property
-    def master_playlist(self) -> Path:
-        return self._output_dir / "master.m3u8"
+    def ready_event(self) -> threading.Event:
+        return self._ready_event
 
-    @property
-    def output_dir(self) -> Path:
-        return self._output_dir
-
-    def _build_argv(self) -> list[str]:
-        """Construct the ffmpeg argv list from input_url + accel + config."""
-        argv: list[str] = [
-            self._accel.ffmpeg_path,
-            "-hide_banner",
-            "-loglevel", "info",
-            "-nostdin",
-        ]
-        if self._accel.decoder and self._accel.decoder != "none":
-            argv += ["-hwaccel", self._accel.decoder]
-        argv += [
-            "-fflags", "+genpts",
-            "-i", self._input_url,
-            "-vf", "null",
-            "-c:v", self._accel.encoder,
-        ]
-        argv += _ENCODER_FLAGS.get(self._accel.encoder, [])
-        # Force a keyframe at each HLS segment boundary so the muxer can always
-        # split at the correct time. Without this, zerolatency / HW encoders may
-        # not produce keyframes at the right interval and the HLS muxer folds all
-        # content into one segment when independent_segments is set.
-        argv += [
-            "-force_key_frames",
-            f"expr:gte(t,n_forced*{self._hls_segment_seconds})",
-        ]
-        argv += [
-            "-c:a", "copy",
-            "-f", "hls",
-            "-hls_time", str(self._hls_segment_seconds),
-            "-hls_list_size", "6",
-            "-hls_flags", "delete_segments+append_list+independent_segments",
-            "-hls_segment_filename", str(self._output_dir / "seg_%05d.ts"),
-            str(self._output_dir / "variant.m3u8"),
-        ]
-        return argv
-
-    def _set_state_locked(
-        self,
-        new_state: TranscoderState,
-        idle_reason: Optional[str] = None,
-    ) -> None:
-        """Caller MUST hold self._state_lock."""
-        if self._state == new_state:
-            return
-        log.info(
-            "transcoder state: %s -> %s%s",
-            self._state.name, new_state.name,
-            f" ({idle_reason})" if idle_reason else "",
-        )
-        self._state = new_state
-        if idle_reason is not None and self._idle_reason is None:
-            self._idle_reason = idle_reason
-        if new_state in (TranscoderState.READY, TranscoderState.FAILED):
-            self._ready_event.set()
-
+    # ---- lifecycle ----
     def _write_master_playlist(self) -> None:
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        (self._output_dir / "master.m3u8").write_text(
-            _MASTER_PLAYLIST, encoding="utf-8"
-        )
+        (self._output_dir / "master.m3u8").write_text(_MASTER_PLAYLIST, encoding="utf-8")
 
-    def start(self) -> None:
-        with self._state_lock:
-            if self._state != TranscoderState.IDLE:
-                raise RuntimeError(
-                    f"start() called in state {self._state.name}; expected IDLE"
-                )
-            self._set_state_locked(TranscoderState.SPAWNING)
-
+    def start(self, argv: list[str]) -> None:
+        # Guard: if stop() was called before start() (race during RELOADING teardown),
+        # skip directory creation and process spawn entirely.  The slot is already
+        # TERMINATING/TERMINATED and its output_dir was (or will be) cleaned up by stop().
+        with self._sub_state_lock:
+            if self._sub_state in (_SlotState.TERMINATING, _SlotState.TERMINATED):
+                return
         self._write_master_playlist()
-
-        argv = self._build_argv()
+        # Second guard after mkdir: stop() may have completed _cleanup_output_dir()
+        # between the check above and the mkdir.  If so, remove the freshly-created
+        # directory ourselves so stop()'s cleanup is not undone.
+        if self._stop_requested.is_set():
+            self._cleanup_output_dir()
+            return
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NO_WINDOW
-        log.info("transcoder spawning: %s", " ".join(argv[:6]) + " ...")
+        log.info("slot spawning in %s", self._output_dir)
         self._process = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -191,55 +190,38 @@ class Transcoder:
             creationflags=creationflags,
         )
         self._warming_started_monotonic = time.monotonic()
-
-        with self._state_lock:
-            self._set_state_locked(TranscoderState.WARMING)
-
-        # Threads land in Tasks 7 + 8. For now spawn the poller thread as a
-        # bare loop so the state visibly remains WARMING in tests.
+        with self._sub_state_lock:
+            self._set_sub_state_locked(_SlotState.WARMING)
         self._poller_thread = threading.Thread(
             target=self._watchdog_poller_loop,
-            name=f"transcoder-poller-{id(self):x}",
+            name=f"slot-poller-{id(self):x}",
             daemon=True,
         )
         self._poller_thread.start()
         self._stderr_thread = threading.Thread(
             target=self._stderr_reader_loop,
-            name=f"transcoder-stderr-{id(self):x}",
+            name=f"slot-stderr-{id(self):x}",
             daemon=True,
         )
         self._stderr_thread.start()
 
-    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
-        """Block until state reaches READY (returns True) or FAILED/timeout
-        (returns False). Default timeout = self.warming_timeout."""
-        if timeout is None:
-            timeout = self._warming_timeout
-        # _ready_event is set by _set_state_locked when entering READY or FAILED
+    def wait_until_ready(self, timeout: float) -> bool:
         signalled = self._ready_event.wait(timeout=timeout)
         if not signalled:
             return False
-        return self._state in (
-            TranscoderState.READY,
-            TranscoderState.STREAMING,
-            TranscoderState.STALLED,
+        return self._sub_state in (
+            _SlotState.READY,
+            _SlotState.STREAMING,
+            _SlotState.STALLED,
         )
 
     def stop(self, drain_seconds: float = 2.0) -> None:
-        """Initiate TERMINATING flow. Idempotent: a second call is a no-op
-        once state is already TERMINATING/TERMINATED."""
-        with self._state_lock:
-            if self._state in (
-                TranscoderState.TERMINATING,
-                TranscoderState.TERMINATED,
-            ):
+        with self._sub_state_lock:
+            if self._sub_state in (_SlotState.TERMINATING, _SlotState.TERMINATED):
                 return
-            prior_state = self._state
-            self._set_state_locked(TranscoderState.TERMINATING)
-
+            self._set_sub_state_locked(_SlotState.TERMINATING)
         self._stop_requested.set()
-
-        # 1) Try graceful drain — write q\n to ffmpeg's stdin
+        self._ready_event.set()        # unblock any wait_until_ready() waiters promptly
         if self._process is not None:
             try:
                 if self._process.stdin is not None:
@@ -247,7 +229,6 @@ class Transcoder:
                     self._process.stdin.flush()
             except Exception:
                 log.exception("stdin q-shutdown failed")
-            # 2) Wait for self-exit
             try:
                 self._exit_code = self._process.wait(timeout=drain_seconds)
             except subprocess.TimeoutExpired:
@@ -259,21 +240,37 @@ class Transcoder:
                     log.error("ffmpeg refused to die even after kill()")
                 except Exception:
                     log.exception("hard kill failed")
-
-        # 3) Reap threads
         for th in (self._stderr_thread, self._poller_thread):
             if th is not None and th.is_alive():
                 th.join(timeout=1.0)
-
-        # 4) Delete output dir
         self._cleanup_output_dir()
+        with self._sub_state_lock:
+            self._set_sub_state_locked(_SlotState.TERMINATED)
 
-        with self._state_lock:
-            self._set_state_locked(TranscoderState.TERMINATED)
-        _ = prior_state  # reserved for future logging
+    # ---- helpers (moved from Transcoder; behavior unchanged) ----
+    def _set_sub_state_locked(self, new: _SlotState, idle_reason: Optional[str] = None) -> None:
+        """Caller MUST hold self._sub_state_lock."""
+        if self._sub_state == new:
+            return
+        log.info(
+            "slot sub_state: %s -> %s%s",
+            self._sub_state.name, new.name,
+            f" ({idle_reason})" if idle_reason else "",
+        )
+        self._sub_state = new
+        if idle_reason is not None and self._idle_reason is None:
+            self._idle_reason = idle_reason
+        if new in (_SlotState.READY, _SlotState.FAILED):
+            self._ready_event.set()
+        # Fire callback OUTSIDE the lock to avoid Transcoder→slot lock-order issues
+        cb = self._on_sub_state_change
+        self._sub_state_lock.release()
+        try:
+            cb(self, new)
+        finally:
+            self._sub_state_lock.acquire()
 
     def _cleanup_output_dir(self) -> None:
-        """Best-effort rmtree with one retry for Windows file locks."""
         try:
             shutil.rmtree(self._output_dir, ignore_errors=False)
             return
@@ -288,7 +285,6 @@ class Transcoder:
             log.exception("output_dir rmtree retry failed; giving up")
 
     def _is_ready_on_disk(self) -> tuple[bool, int]:
-        """Returns (ready, seg_count). Ready iff >= 2 segs AND master AND variant exist."""
         try:
             segs = sorted(self._output_dir.glob("seg_*.ts"))
         except OSError:
@@ -303,106 +299,72 @@ class Transcoder:
         return True, seg_count
 
     def _check_process_exit_locked(self) -> bool:
-        """Returns True iff state transitioned to FAILED due to subprocess exit.
-        Caller must NOT hold _state_lock — this method acquires it briefly.
-        """
+        """Returns True iff slot transitioned to FAILED. Acquires sub_state_lock briefly."""
         assert self._process is not None
         code = self._process.poll()
         if code is None:
             return False
-        # If ffmpeg exited cleanly, do a final filesystem check before declaring
-        # failure — a fast finite source (e.g., a lavfi test file) may write all
-        # segments and exit before the watchdog's next poll. Do this outside the
-        # lock since _is_ready_on_disk only touches the filesystem.
         final_ready = False
         final_seg_count = 0
         if code == 0:
             final_ready, final_seg_count = self._is_ready_on_disk()
-        with self._state_lock:
+        with self._sub_state_lock:
             self._exit_code = code
-            if self._state in (
-                TranscoderState.SPAWNING,
-                TranscoderState.WARMING,
-            ):
+            if self._sub_state in (_SlotState.SPAWNING, _SlotState.WARMING):
                 if final_ready:
-                    # ffmpeg wrote all output and exited cleanly → treat as READY
-                    self._set_state_locked(TranscoderState.READY)
+                    self._set_sub_state_locked(_SlotState.READY)
                     self._last_seg_count = final_seg_count
                     self._last_new_seg_monotonic = time.monotonic()
-                    return False  # not a failure
-                self._set_state_locked(
-                    TranscoderState.FAILED,
-                    idle_reason="subprocess_died_early",
-                )
+                    return False
+                self._set_sub_state_locked(_SlotState.FAILED, idle_reason="subprocess_died_early")
                 return True
-            if self._state in (
-                TranscoderState.READY,
-                TranscoderState.STREAMING,
-                TranscoderState.STALLED,
+            if self._sub_state in (
+                _SlotState.READY, _SlotState.STREAMING, _SlotState.STALLED,
             ) and code != 0:
-                self._set_state_locked(
-                    TranscoderState.FAILED, idle_reason="unknown"
-                )
+                self._set_sub_state_locked(_SlotState.FAILED, idle_reason="unknown")
                 return True
-            # state already FAILED/TERMINATING/TERMINATED, or exited 0 post-READY
             return False
 
     def _watchdog_poller_loop(self) -> None:
-        """Drives WARMING -> READY -> STREAMING <-> STALLED + early-exit /
-        timeout failures. Exits when state is FAILED or TERMINATED.
-
-        Later tasks (11, 12) extend this loop. Keep it readable.
-        """
         while not self._stop_requested.is_set():
             time.sleep(self._poll_interval)
-            with self._state_lock:
-                current = self._state
+            with self._sub_state_lock:
+                current = self._sub_state
             if current in (
-                TranscoderState.FAILED,
-                TranscoderState.TERMINATING,
-                TranscoderState.TERMINATED,
+                _SlotState.FAILED, _SlotState.TERMINATING, _SlotState.TERMINATED,
             ):
                 return
-
-            # Check subprocess health FIRST so an exited proc can't be reported
-            # as READY just because someone touched files at the right moment.
             if self._check_process_exit_locked():
                 return
-
-            if current == TranscoderState.WARMING:
-                # Check timeout BEFORE readiness so a slow upstream that takes
-                # >warming_timeout to produce 2 segs trips FAILED, not READY.
+            if current == _SlotState.WARMING:
                 if (
                     time.monotonic() - self._warming_started_monotonic
                     > self._warming_timeout
                 ):
-                    with self._state_lock:
-                        if self._state == TranscoderState.WARMING:
-                            self._set_state_locked(
-                                TranscoderState.FAILED,
-                                idle_reason="warming_timed_out",
+                    with self._sub_state_lock:
+                        if self._sub_state == _SlotState.WARMING:
+                            self._set_sub_state_locked(
+                                _SlotState.FAILED, idle_reason="warming_timed_out",
                             )
                     continue
                 ready, seg_count = self._is_ready_on_disk()
                 if ready:
-                    with self._state_lock:
-                        if self._state == TranscoderState.WARMING:
-                            self._set_state_locked(TranscoderState.READY)
+                    with self._sub_state_lock:
+                        if self._sub_state == _SlotState.WARMING:
+                            self._set_sub_state_locked(_SlotState.READY)
                             self._last_seg_count = seg_count
                             self._last_new_seg_monotonic = time.monotonic()
                     continue
-
-            if current == TranscoderState.READY:
+            if current == _SlotState.READY:
                 _, seg_count = self._is_ready_on_disk()
                 if seg_count > self._last_seg_count:
-                    with self._state_lock:
-                        if self._state == TranscoderState.READY:
-                            self._set_state_locked(TranscoderState.STREAMING)
+                    with self._sub_state_lock:
+                        if self._sub_state == _SlotState.READY:
+                            self._set_sub_state_locked(_SlotState.STREAMING)
                             self._last_seg_count = seg_count
                             self._last_new_seg_monotonic = time.monotonic()
                 continue
-
-            if current == TranscoderState.STREAMING:
+            if current == _SlotState.STREAMING:
                 _, seg_count = self._is_ready_on_disk()
                 if seg_count > self._last_seg_count:
                     self._last_seg_count = seg_count
@@ -411,27 +373,21 @@ class Transcoder:
                     time.monotonic() - self._last_new_seg_monotonic
                     > self._stall_timeout
                 ):
-                    with self._state_lock:
-                        if self._state == TranscoderState.STREAMING:
-                            self._set_state_locked(TranscoderState.STALLED)
+                    with self._sub_state_lock:
+                        if self._sub_state == _SlotState.STREAMING:
+                            self._set_sub_state_locked(_SlotState.STALLED)
                 continue
-
-            if current == TranscoderState.STALLED:
+            if current == _SlotState.STALLED:
                 _, seg_count = self._is_ready_on_disk()
                 if seg_count > self._last_seg_count:
                     self._last_seg_count = seg_count
                     self._last_new_seg_monotonic = time.monotonic()
-                    with self._state_lock:
-                        if self._state == TranscoderState.STALLED:
-                            self._set_state_locked(TranscoderState.STREAMING)
+                    with self._sub_state_lock:
+                        if self._sub_state == _SlotState.STALLED:
+                            self._set_sub_state_locked(_SlotState.STREAMING)
                 continue
 
     def _stderr_reader_loop(self) -> None:
-        """Drives state -> FAILED on any line matching _FATAL_PATTERNS.
-
-        Continues reading after the first fatal match so subsequent stderr
-        is still logged (useful for diagnostics). Exits when stderr closes.
-        """
         assert self._process is not None
         try:
             for raw_line in self._process.stderr:  # type: ignore[union-attr]
@@ -440,19 +396,330 @@ class Transcoder:
                     log.debug("ffmpeg stderr: %s", line)
                 reason = _classify_stderr_line(line)
                 if reason is not None:
-                    with self._state_lock:
-                        if self._state in (
-                            TranscoderState.SPAWNING,
-                            TranscoderState.WARMING,
-                            TranscoderState.READY,
-                            TranscoderState.STREAMING,
-                            TranscoderState.STALLED,
+                    with self._sub_state_lock:
+                        if self._sub_state in (
+                            _SlotState.SPAWNING, _SlotState.WARMING,
+                            _SlotState.READY, _SlotState.STREAMING, _SlotState.STALLED,
                         ):
-                            self._set_state_locked(
-                                TranscoderState.FAILED, idle_reason=reason
-                            )
+                            self._set_sub_state_locked(_SlotState.FAILED, idle_reason=reason)
         except Exception:
             log.exception("stderr reader crashed")
+
+
+_SUBSTATE_TO_STATE: dict[_SlotState, TranscoderState] = {
+    _SlotState.SPAWNING:    TranscoderState.SPAWNING,
+    _SlotState.WARMING:     TranscoderState.WARMING,
+    _SlotState.READY:       TranscoderState.READY,
+    _SlotState.STREAMING:   TranscoderState.STREAMING,
+    _SlotState.STALLED:     TranscoderState.STALLED,
+    _SlotState.FAILED:      TranscoderState.FAILED,
+    _SlotState.TERMINATING: TranscoderState.TERMINATING,
+    _SlotState.TERMINATED:  TranscoderState.TERMINATED,
+}
+
+
+class Transcoder:
+    """Manages one ffmpeg subprocess per cast session that re-segments an input HLS source.
+
+    State machine (every observable state is enumerated; no predicate ever
+    treats "not active" as "done" — see 2026-04-22 IDLE-race lesson):
+
+        IDLE         constructed; start() not yet called
+        SPAWNING     _current slot in SPAWNING
+        WARMING      _current slot in WARMING
+        READY        _current slot in READY
+        STREAMING    _current slot in STREAMING
+        STALLED      _current slot in STALLED
+        FAILED       _current slot in FAILED AND _next is None or also FAILED
+        TERMINATING  stop() called; draining
+        TERMINATED   subprocess reaped + output_dir deleted
+
+    P2.3 adds RELOADING — wired in Task 5.
+    """
+
+    def __init__(
+        self,
+        input_url: str,
+        output_dir: Optional[Path] = None,
+        accel: Optional[AccelProfile] = None,          # required; type-checked below
+        *,
+        base_output_dir: Optional[Path] = None,
+        filter_chain: Optional[FilterChain] = None,
+        warming_timeout: float = 8.0,
+        stall_timeout: float = 8.0,
+        hls_segment_seconds: int = 2,
+        _poll_interval: float = 0.25,
+    ) -> None:
+        if accel is None:
+            raise TypeError("Transcoder requires accel: AccelProfile")
+        base = base_output_dir if base_output_dir is not None else output_dir
+        if base is None:
+            raise TypeError("Transcoder requires base_output_dir (or legacy output_dir)")
+        self._input_url = input_url
+        self._accel = accel
+        self._base_output_dir = Path(base)
+        self._filter_chain: FilterChain = filter_chain or FilterChain([NoopFilter()])
+        self._warming_timeout = warming_timeout
+        self._stall_timeout = stall_timeout
+        self._hls_segment_seconds = hls_segment_seconds
+        self._poll_interval = _poll_interval
+
+        self._state: TranscoderState = TranscoderState.IDLE
+        self._state_lock = threading.Lock()
+        self._ready_event = threading.Event()
+        self._current: Optional[_ProcessSlot] = None
+        self._next: Optional[_ProcessSlot] = None      # Task 6 populates this
+        self._slot_counter: int = 0                    # Task 6 increments this
+        self._last_reload_error: Optional[str] = None
+        self._filter_chain_pending: Optional[FilterChain] = None
+
+    # ---- public properties ----
+    @property
+    def state(self) -> TranscoderState:
+        return self._state
+
+    @property
+    def idle_reason(self) -> Optional[str]:
+        if self._current is None:
+            return None
+        return self._current.idle_reason
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        if self._current is None:
+            return None
+        return self._current.exit_code
+
+    @property
+    def output_dir(self) -> Path:
+        """The CURRENT slot's output_dir. Before start() this is a placeholder."""
+        if self._current is None:
+            # Pre-start: synthesize the v1 path so callers querying early get something predictable.
+            return self._base_output_dir / "v1"
+        return self._current.output_dir
+
+    @property
+    def master_playlist(self) -> Path:
+        return self.output_dir / "master.m3u8"
+
+    @property
+    def last_reload_error(self) -> Optional[str]:
+        """The idle_reason from the most recent failed set_filter_chain() call.
+
+        Cleared on the next successful reload. Survives across multiple failed
+        reloads — only the most recent reason is exposed.
+        """
+        return self._last_reload_error
+
+    # ---- lifecycle ----
+    def start(self) -> None:
+        with self._state_lock:
+            if self._state != TranscoderState.IDLE:
+                raise RuntimeError(
+                    f"start() called in state {self._state.name}; expected IDLE"
+                )
+            self._set_state_locked(TranscoderState.SPAWNING)
+            self._slot_counter = 1
+        slot_dir = self._base_output_dir / f"v{self._slot_counter}"
+        self._current = _ProcessSlot(
+            output_dir=slot_dir,
+            warming_timeout=self._warming_timeout,
+            stall_timeout=self._stall_timeout,
+            poll_interval=self._poll_interval,
+            on_sub_state_change=self._on_current_substate_change,
+        )
+        argv = _build_argv(
+            input_url=self._input_url,
+            output_dir=slot_dir,
+            accel=self._accel,
+            hls_segment_seconds=self._hls_segment_seconds,
+            vf_fragment=self._filter_chain.render(self._input_url),
+        )
+        self._current.start(argv)
+        # _current's start() already moved sub_state to WARMING; mirror to aggregate
+        with self._state_lock:
+            self._set_state_locked(TranscoderState.WARMING)
+
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        if timeout is None:
+            timeout = self._warming_timeout
+        signalled = self._ready_event.wait(timeout=timeout)
+        if not signalled:
+            return False
+        return self._state in (
+            TranscoderState.READY, TranscoderState.STREAMING, TranscoderState.STALLED,
+        )
+
+    def stop(self, drain_seconds: float = 2.0) -> None:
+        with self._state_lock:
+            if self._state in (TranscoderState.TERMINATING, TranscoderState.TERMINATED):
+                return
+            self._set_state_locked(TranscoderState.TERMINATING)
+            # Snapshot refs under the lock to avoid a data race with set_filter_chain
+            # writing self._next outside the lock during its wait_until_ready() call.
+            next_slot = self._next
+            current_slot = self._current
+            self._next = None
+        # Stop NEW first if it exists (Task 6+); always stop _current
+        if next_slot is not None:
+            next_slot.stop(drain_seconds=drain_seconds)
+        if current_slot is not None:
+            current_slot.stop(drain_seconds=drain_seconds)
+        with self._state_lock:
+            self._set_state_locked(TranscoderState.TERMINATED)
+
+    # ---- back-compat shim for tests that call t._build_argv() ----
+    def _build_argv(self) -> list[str]:
+        return _build_argv(
+            input_url=self._input_url,
+            output_dir=self._base_output_dir / "v1",
+            accel=self._accel,
+            hls_segment_seconds=self._hls_segment_seconds,
+            vf_fragment=self._filter_chain.render(self._input_url),
+        )
+
+    # ---- private internals ----
+    def _set_state_locked(self, new: TranscoderState, idle_reason: Optional[str] = None) -> None:
+        """Caller MUST hold self._state_lock."""
+        if self._state == new:
+            return
+        log.info(
+            "transcoder state: %s -> %s%s",
+            self._state.name, new.name,
+            f" ({idle_reason})" if idle_reason else "",
+        )
+        self._state = new
+        if new in (TranscoderState.READY, TranscoderState.FAILED):
+            self._ready_event.set()
+
+    def _on_current_substate_change(
+        self, slot: _ProcessSlot, new_sub_state: _SlotState
+    ) -> None:
+        """Callback fired by _current when its sub_state changes.
+        Translates sub_state to public TranscoderState.
+        """
+        with self._state_lock:
+            # Ignore callbacks if we're already TERMINATING/TERMINATED
+            if self._state in (TranscoderState.TERMINATING, TranscoderState.TERMINATED):
+                return
+            # Ignore callbacks from slots that are no longer _current (e.g. OLD
+            # slot being stopped after a successful promotion).
+            if slot is not self._current:
+                return
+            if self._next is not None:
+                # We're RELOADING. The public state aggregate stays RELOADING
+                # regardless of _current's sub-state changes. _current may even
+                # transition to FAILED here (OLD dies mid-reload); we still let
+                # NEW try to come up. Final state is reconciled in
+                # set_filter_chain after _next's ready_event fires.
+                return
+            # Map _SlotState → TranscoderState (1:1 in Task 1; Task 6 adds RELOADING logic)
+            mapped = _SUBSTATE_TO_STATE[new_sub_state]
+            self._set_state_locked(mapped, idle_reason=slot.idle_reason)
+
+    def _on_next_substate_change(
+        self, slot: _ProcessSlot, new_sub_state: _SlotState
+    ) -> None:
+        """Callback for the _next slot. We don't update public state here —
+        set_filter_chain's blocked thread does that via _next.ready_event.
+        """
+        # No-op for Task 6: the blocked thread in set_filter_chain handles the
+        # promotion/demotion decision after wait_until_ready() returns.
+        pass
+
+    def _aggregate_current_state_locked(self) -> TranscoderState:
+        """Map _current's sub_state to a public TranscoderState. Caller MUST hold _state_lock."""
+        if self._current is None:
+            return TranscoderState.IDLE
+        return _SUBSTATE_TO_STATE[self._current.sub_state]
+
+    def set_filter_chain(self, chain: FilterChain) -> bool:
+        """Hot-reload the filter chain.
+
+        Blocks until NEW reaches READY (returns True; OLD killed; cast continues
+        with the new chain) or NEW fails to reach READY (returns False; OLD still
+        streaming; chain unchanged; last_reload_error set).
+
+        Raises RuntimeError if called in IDLE/SPAWNING/WARMING/FAILED/TERMINATING/
+        TERMINATED, or if a reload is already in progress.
+        """
+        with self._state_lock:
+            if self._state in (
+                TranscoderState.IDLE, TranscoderState.SPAWNING, TranscoderState.WARMING,
+                TranscoderState.FAILED, TranscoderState.TERMINATING, TranscoderState.TERMINATED,
+            ):
+                raise RuntimeError(
+                    f"set_filter_chain in state {self._state.name}; "
+                    f"only READY/STREAMING/STALLED can initiate a reload"
+                )
+            if self._next is not None:
+                raise RuntimeError("set_filter_chain: reload already in progress")
+            # Allocate NEW slot
+            self._slot_counter += 1
+            new_dir = self._base_output_dir / f"v{self._slot_counter}"
+            self._next = _ProcessSlot(
+                output_dir=new_dir,
+                warming_timeout=self._warming_timeout,
+                stall_timeout=self._stall_timeout,
+                poll_interval=self._poll_interval,
+                on_sub_state_change=self._on_next_substate_change,
+            )
+            self._filter_chain_pending = chain
+            self._set_state_locked(TranscoderState.RELOADING)
+
+        # Build argv with the new chain
+        argv = _build_argv(
+            input_url=self._input_url,
+            output_dir=new_dir,
+            accel=self._accel,
+            hls_segment_seconds=self._hls_segment_seconds,
+            vf_fragment=chain.render(self._input_url),
+        )
+        # Capture a local reference: stop() may null self._next concurrently.
+        # _ProcessSlot.start() is guarded so it won't create output_dir if the
+        # slot has already been stopped.
+        next_slot_local: _ProcessSlot = self._next  # type: ignore[assignment]
+        next_slot_local.start(argv)
+
+        # Block until NEW reaches READY or FAILED (or timeout).
+        # Use the local reference — stop() may have set self._next to None.
+        promoted = next_slot_local.wait_until_ready(timeout=self._warming_timeout)
+
+        next_to_stop: Optional[_ProcessSlot] = None
+        result: bool = False
+
+        with self._state_lock:
+            if self._state in (TranscoderState.TERMINATING, TranscoderState.TERMINATED):
+                # Caller called stop() during the wait — clean up NEW
+                next_to_stop = self._next
+                self._next = None
+                self._filter_chain_pending = None
+                result = False
+            elif not promoted or self._next.sub_state == _SlotState.FAILED:
+                # Task 7 expands this path; happy path here doesn't exercise it.
+                self._last_reload_error = self._next.idle_reason or "reload_warming_timed_out"
+                next_to_stop = self._next
+                self._next = None
+                self._filter_chain_pending = None
+                self._set_state_locked(self._aggregate_current_state_locked())
+                result = False
+            else:
+                # Promote
+                next_to_stop = self._current
+                self._current = self._next
+                self._next = None
+                self._filter_chain = self._filter_chain_pending
+                self._filter_chain_pending = None
+                self._last_reload_error = None
+                self._set_state_locked(self._aggregate_current_state_locked())
+                result = True
+
+        # Stop the discarded slot outside the lock (rmtree is slow on Windows).
+        # Demote / abort branches kill fast (NEW is failed or being torn down);
+        # promote keeps the full graceful drain so OLD can finish its in-flight segment.
+        if next_to_stop is not None:
+            next_to_stop.stop(drain_seconds=2.0 if result else 0.1)
+        return result
 
 
 # Per-encoder flags. Values verified against current ffmpeg HLS muxer +
@@ -508,6 +775,7 @@ _FATAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"Error.*opening encoder", re.I), "encoder_init_failed"),
     (re.compile(r"Cannot initialize.*encoder", re.I), "encoder_init_failed"),
     (re.compile(r"Failed to open codec", re.I), "encoder_init_failed"),
+    (re.compile(r"Stream specifier.*matches no streams", re.I), "subtitle_stream_missing"),
 ]
 
 
