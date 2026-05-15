@@ -262,6 +262,7 @@ def test_master_playlist_written_on_start(tmp_path, sw_profile):
             assert "RESOLUTION=1280x720" in contents
             assert contents.rstrip().endswith("variant.m3u8")
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -294,6 +295,7 @@ def test_start_transitions_to_warming(tmp_path, sw_profile):
             assert kwargs["stdin"] == subprocess.PIPE
             assert kwargs["stderr"] == subprocess.PIPE
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -312,6 +314,7 @@ def test_start_raises_when_called_twice(tmp_path, sw_profile):
             with pytest.raises(RuntimeError):
                 t.start()
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -394,6 +397,7 @@ def test_warming_to_failed_on_stderr_nvenc_pattern(tmp_path, sw_profile):
                 f"state={t.state}"
             assert t.idle_reason == "hwaccel_unavailable"
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -415,6 +419,7 @@ def test_warming_to_failed_on_stderr_input_pattern(tmp_path, sw_profile):
                 f"state={t.state}"
             assert t.idle_reason == "input_unreachable"
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -453,6 +458,7 @@ def test_warming_to_ready_when_files_appear(tmp_path, sw_profile):
             assert _wait_for_state(t, TranscoderState.READY, timeout=1.0), \
                 f"state={t.state}"
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -475,6 +481,7 @@ def test_warming_to_failed_on_timeout(tmp_path, sw_profile):
                 f"state={t.state}"
             assert t.idle_reason == "warming_timed_out"
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -528,6 +535,7 @@ def test_ready_to_streaming_on_new_seg(tmp_path, sw_profile):
             assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0), \
                 f"state={t.state}"
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -556,6 +564,7 @@ def test_streaming_to_stalled_on_quiet(tmp_path, sw_profile):
             assert _wait_for_state(t, TranscoderState.STALLED, timeout=1.0), \
                 f"state={t.state}"
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -584,6 +593,7 @@ def test_stalled_recovers_to_streaming(tmp_path, sw_profile):
             assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0), \
                 f"state={t.state}"
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -610,6 +620,7 @@ def test_wait_until_ready_true_when_ready(tmp_path, sw_profile):
             assert t.wait_until_ready(timeout=2.0) is True
             assert t.state in (TranscoderState.READY, TranscoderState.STREAMING)
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -629,6 +640,7 @@ def test_wait_until_ready_false_on_failure(tmp_path, sw_profile):
             assert t.wait_until_ready(timeout=2.0) is False
             assert t.state == TranscoderState.FAILED
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
@@ -647,6 +659,7 @@ def test_wait_until_ready_false_on_timeout(tmp_path, sw_profile):
         try:
             assert t.wait_until_ready(timeout=0.2) is False
         finally:
+            fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
             t.stop()
 
 
