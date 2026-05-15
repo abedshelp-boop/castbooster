@@ -153,3 +153,78 @@ def test_initial_state_is_idle(tmp_path, sw_profile):
     assert t.state == TranscoderState.IDLE
     assert t.idle_reason is None
     assert t.exit_code is None
+
+
+# ---------- ffmpeg argv construction -----------------------------------------
+
+def test_command_uses_libx264_flags_for_sw_tier(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+    )
+    argv = t._build_argv()
+    assert "C:/fake/ffmpeg.exe" == argv[0]
+    assert "-c:v" in argv
+    enc_idx = argv.index("-c:v")
+    assert argv[enc_idx + 1] == "libx264"
+    # libx264-specific flags from the spec table
+    assert "-preset" in argv and "veryfast" in argv
+    assert "-tune" in argv and "zerolatency" in argv
+    assert "-pix_fmt" in argv and "yuv420p" in argv
+    # Common flags
+    assert "-vf" in argv and "null" in argv
+    assert "-c:a" in argv and "copy" in argv
+    assert "-hls_time" in argv and "2" in argv
+    assert "-hls_list_size" in argv and "6" in argv
+    assert "-f" in argv and "hls" in argv
+    # Input URL passed through
+    assert "http://x/m.m3u8" in argv
+
+
+def test_command_omits_hwaccel_when_decoder_is_none(tmp_path, sw_profile):
+    from dataclasses import replace
+    from castbooster.transcoder import Transcoder
+    profile = replace(sw_profile, decoder="none")
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=profile,
+    )
+    argv = t._build_argv()
+    assert "-hwaccel" not in argv
+
+
+def test_command_includes_hwaccel_when_decoder_available(tmp_path, sw_profile):
+    from dataclasses import replace
+    from castbooster.transcoder import Transcoder
+    profile = replace(sw_profile, decoder="cuda", encoder="h264_nvenc", tier="nvidia")
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=profile,
+    )
+    argv = t._build_argv()
+    assert "-hwaccel" in argv
+    hw_idx = argv.index("-hwaccel")
+    assert argv[hw_idx + 1] == "cuda"
+    enc_idx = argv.index("-c:v")
+    assert argv[enc_idx + 1] == "h264_nvenc"
+    # nvenc-specific flags from the spec table
+    assert "-preset" in argv and "p5" in argv
+    assert "-rc" in argv and "cbr" in argv
+
+
+def test_command_segment_paths_under_output_dir(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder
+    out = tmp_path / "out"
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=out,
+        accel=sw_profile,
+    )
+    argv = t._build_argv()
+    seg_idx = argv.index("-hls_segment_filename")
+    assert str(out / "seg_%05d.ts") == argv[seg_idx + 1]
+    assert str(out / "variant.m3u8") == argv[-1]
