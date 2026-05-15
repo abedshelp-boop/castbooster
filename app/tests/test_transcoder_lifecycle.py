@@ -752,3 +752,26 @@ def test_failed_keeps_idle_reason_after_stop(tmp_path, sw_profile):
         t.stop(drain_seconds=1.0)
         assert t.state == TranscoderState.TERMINATED
         assert t.idle_reason == "hwaccel_unavailable"   # preserved
+
+
+# ---------- stop() deletes output_dir on TERMINATED --------------------------
+
+def test_terminated_deletes_output_dir(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder
+    fake = FakeFfmpegProcess()
+    out = tmp_path / "out"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=out,
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        # Drop a fake segment so we can verify it's gone
+        _touch_segment(out, 0)
+        assert out.exists()
+        threading.Thread(target=lambda: (time.sleep(0.05), fake.set_exit(0)),
+                         daemon=True).start()
+        t.stop(drain_seconds=1.0)
+        assert not out.exists(), f"output_dir survived stop(): {list(out.iterdir())}"

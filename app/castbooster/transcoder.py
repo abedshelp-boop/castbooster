@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -256,10 +257,27 @@ class Transcoder:
             if th is not None and th.is_alive():
                 th.join(timeout=1.0)
 
+        # 4) Delete output dir
+        self._cleanup_output_dir()
+
         with self._state_lock:
             self._set_state_locked(TranscoderState.TERMINATED)
-        # Output dir cleanup lands in Task 17
         _ = prior_state  # reserved for future logging
+
+    def _cleanup_output_dir(self) -> None:
+        """Best-effort rmtree with one retry for Windows file locks."""
+        try:
+            shutil.rmtree(self._output_dir, ignore_errors=False)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            log.warning("output_dir rmtree failed (will retry): %s", e)
+        time.sleep(0.5)
+        try:
+            shutil.rmtree(self._output_dir, ignore_errors=True)
+        except Exception:
+            log.exception("output_dir rmtree retry failed; giving up")
 
     def _is_ready_on_disk(self) -> tuple[bool, int]:
         """Returns (ready, seg_count). Ready iff >= 2 segs AND master AND variant exist."""
