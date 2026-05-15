@@ -234,9 +234,10 @@ def test_command_segment_paths_under_output_dir(tmp_path, sw_profile):
         accel=sw_profile,
     )
     argv = t._build_argv()
-    seg_idx = argv.index("-hls_segment_filename")
-    assert str(out / "seg_%05d.ts") == argv[seg_idx + 1]
-    assert str(out / "variant.m3u8") == argv[-1]
+    seg_path = str(out / "v1" / "seg_%05d.ts")          # v1 subdir
+    var_path = str(out / "v1" / "variant.m3u8")
+    assert seg_path in argv, f"expected {seg_path} in {argv}"
+    assert var_path in argv, f"expected {var_path} in {argv}"
 
 
 # ---------- Master playlist --------------------------------------------------
@@ -253,7 +254,8 @@ def test_master_playlist_written_on_start(tmp_path, sw_profile):
         )
         t.start()
         try:
-            master = tmp_path / "out" / "master.m3u8"
+            seg_dir = t.output_dir          # <base>/v1
+            master = seg_dir / "master.m3u8"
             assert master.exists()
             contents = master.read_text(encoding="utf-8")
             assert contents.startswith("#EXTM3U")
@@ -451,10 +453,10 @@ def test_warming_to_ready_when_files_appear(tmp_path, sw_profile):
         t.start()
         try:
             assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
-            # Simulate ffmpeg writing output files
-            _touch_segment(out, 0)
-            _touch_segment(out, 1)
-            _touch_variant(out)
+            seg_dir = t.output_dir          # <base>/v1
+            _touch_segment(seg_dir, 0)
+            _touch_segment(seg_dir, 1)
+            _touch_variant(seg_dir)
             assert _wait_for_state(t, TranscoderState.READY, timeout=1.0), \
                 f"state={t.state}"
         finally:
@@ -529,11 +531,12 @@ def test_warming_to_ready_on_clean_exit_with_files(tmp_path, sw_profile):
         t.start()
         try:
             assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            seg_dir = t.output_dir          # <base>/v1
             # Simulate the race: files appear AND subprocess exits 0
             # before the poller's next tick.
-            _touch_segment(out, 0)
-            _touch_segment(out, 1)
-            _touch_variant(out)
+            _touch_segment(seg_dir, 0)
+            _touch_segment(seg_dir, 1)
+            _touch_variant(seg_dir)
             fake.set_exit(0)
             assert _wait_for_state(t, TranscoderState.READY, timeout=1.0), \
                 f"state={t.state} reason={t.idle_reason}"
@@ -559,12 +562,13 @@ def test_ready_to_streaming_on_new_seg(tmp_path, sw_profile):
         t.start()
         try:
             assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
-            _touch_segment(out, 0)
-            _touch_segment(out, 1)
-            _touch_variant(out)
+            seg_dir = t.output_dir          # <base>/v1
+            _touch_segment(seg_dir, 0)
+            _touch_segment(seg_dir, 1)
+            _touch_variant(seg_dir)
             assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
             # Now a 3rd segment appears → STREAMING
-            _touch_segment(out, 2)
+            _touch_segment(seg_dir, 2)
             assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0), \
                 f"state={t.state}"
         finally:
@@ -589,9 +593,10 @@ def test_streaming_to_stalled_on_quiet(tmp_path, sw_profile):
         t.start()
         try:
             assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
-            _touch_segment(out, 0); _touch_segment(out, 1); _touch_variant(out)
+            seg_dir = t.output_dir          # <base>/v1
+            _touch_segment(seg_dir, 0); _touch_segment(seg_dir, 1); _touch_variant(seg_dir)
             assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
-            _touch_segment(out, 2)
+            _touch_segment(seg_dir, 2)
             assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0)
             # Now no new segs → STALLED after stall_timeout
             assert _wait_for_state(t, TranscoderState.STALLED, timeout=1.0), \
@@ -616,13 +621,14 @@ def test_stalled_recovers_to_streaming(tmp_path, sw_profile):
         t.start()
         try:
             assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
-            _touch_segment(out, 0); _touch_segment(out, 1); _touch_variant(out)
+            seg_dir = t.output_dir          # <base>/v1
+            _touch_segment(seg_dir, 0); _touch_segment(seg_dir, 1); _touch_variant(seg_dir)
             assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
-            _touch_segment(out, 2)
+            _touch_segment(seg_dir, 2)
             assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0)
             assert _wait_for_state(t, TranscoderState.STALLED, timeout=1.0)
             # New seg → back to STREAMING
-            _touch_segment(out, 3)
+            _touch_segment(seg_dir, 3)
             assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0), \
                 f"state={t.state}"
         finally:
@@ -645,10 +651,11 @@ def test_wait_until_ready_true_when_ready(tmp_path, sw_profile):
         )
         t.start()
         try:
+            seg_dir = t.output_dir          # <base>/v1
             # Have a background producer race against wait_until_ready
             def produce():
                 time.sleep(0.1)
-                _touch_segment(out, 0); _touch_segment(out, 1); _touch_variant(out)
+                _touch_segment(seg_dir, 0); _touch_segment(seg_dir, 1); _touch_variant(seg_dir)
             threading.Thread(target=produce, daemon=True).start()
             assert t.wait_until_ready(timeout=2.0) is True
             assert t.state in (TranscoderState.READY, TranscoderState.STREAMING)
@@ -790,7 +797,7 @@ def test_failed_keeps_idle_reason_after_stop(tmp_path, sw_profile):
 # ---------- stop() deletes output_dir on TERMINATED --------------------------
 
 def test_terminated_deletes_output_dir(tmp_path, sw_profile):
-    from castbooster.transcoder import Transcoder
+    from castbooster.transcoder import Transcoder, TranscoderState
     fake = FakeFfmpegProcess()
     out = tmp_path / "out"
     with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
@@ -801,10 +808,15 @@ def test_terminated_deletes_output_dir(tmp_path, sw_profile):
             _poll_interval=0.05,
         )
         t.start()
-        # Drop a fake segment so we can verify it's gone
-        _touch_segment(out, 0)
-        assert out.exists()
-        threading.Thread(target=lambda: (time.sleep(0.05), fake.set_exit(0)),
-                         daemon=True).start()
-        t.stop(drain_seconds=1.0)
-        assert not out.exists(), f"output_dir survived stop(): {list(out.iterdir())}"
+        slot_dir = t.output_dir              # capture before stop() — this is <base>/v1
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            # Drop a fake segment so we can verify it's gone
+            _touch_segment(slot_dir, 0)
+            assert slot_dir.exists()
+        finally:
+            fake.set_exit(0)
+            t.stop()
+        assert t.state == TranscoderState.TERMINATED
+        assert not slot_dir.exists(), \
+            f"slot output_dir survived stop(): {list(slot_dir.iterdir()) if slot_dir.exists() else 'gone'}"
