@@ -31,6 +31,38 @@ from typing import List, Optional                                        # noqa:
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class AccelProfile:
+    """Immutable summary of ffmpeg capabilities + the chosen encode lane.
+
+    Consumed by the transcoder (P2.2) to build its ffmpeg command line.
+    """
+    ffmpeg_path: str
+    encoder: str            # "h264_nvenc" | "h264_qsv" | "h264_amf" | "libx264"
+    decoder: str            # "cuda" | "qsv" | "d3d11va" | "dxva2" | "none"
+    tier: str               # "nvidia" | "intel" | "amd" | "sw"
+    available_encoders: List[str] = field(default_factory=list)
+    available_hwaccels: List[str] = field(default_factory=list)
+    ffmpeg_version: str = ""
+
+
+# Priority order for encoder selection. Earlier entries win when both are usable.
+_ENCODER_CANDIDATES = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
+_TIER_FOR_ENCODER = {
+    "h264_nvenc": "nvidia",
+    "h264_qsv": "intel",
+    "h264_amf": "amd",
+    "libx264": "sw",
+}
+# Decoder priority per tier. "none" means SW decode (always available).
+_DECODER_FOR_TIER = {
+    "nvidia": ("cuda", "d3d11va", "none"),
+    "intel":  ("qsv",  "d3d11va", "none"),
+    "amd":    ("d3d11va", "dxva2", "none"),
+    "sw":     ("d3d11va", "dxva2", "none"),
+}
+
+
 def parse_hwaccels(output: str) -> List[str]:
     """Parse `ffmpeg -hwaccels` stdout into a list of accel method names.
 
@@ -178,3 +210,84 @@ def try_encoder(ffmpeg_path: str, encoder: str) -> bool:
     except Exception:
         log.exception("encoder %s probe crashed", encoder)
         return False
+
+
+def _pick_decoder(tier: str, available_hwaccels: List[str]) -> str:
+    """Pick the best decoder for the given tier, prefer matched HW decode."""
+    for candidate in _DECODER_FOR_TIER[tier]:
+        if candidate == "none":
+            return "none"
+        if candidate in available_hwaccels:
+            return candidate
+    return "none"
+
+
+def _ffmpeg_version(ffmpeg_path: str) -> str:
+    """Return the version token from `ffmpeg -version`'s first line.
+
+    Best-effort — returns "" on any failure, since version is informational
+    only and not load-bearing.
+    """
+    try:
+        r = _run([ffmpeg_path, "-hide_banner", "-version"], timeout=5.0)
+        first = (r.stdout or "").splitlines()[0] if r.stdout else ""
+        tokens = first.split()
+        # "ffmpeg version 8.1-full_build-www.gyan.dev Copyright (c) ..."
+        if len(tokens) >= 3 and tokens[0] == "ffmpeg" and tokens[1] == "version":
+            return tokens[2]
+    except Exception:
+        log.exception("ffmpeg -version failed")
+    return ""
+
+
+@lru_cache(maxsize=2)
+def detect(ffmpeg_path_override: Optional[str] = None) -> AccelProfile:
+    """Locate ffmpeg, enumerate capabilities, pick a working encode lane.
+
+    Cached per-process via lru_cache. Subsequent calls with the same args
+    return the previously-computed AccelProfile without running ffmpeg again.
+
+    Raises FFmpegNotFoundError if no ffmpeg binary is found.
+    Raises FFmpegProbeError if every encoder candidate fails the runtime test
+    (which would mean even libx264 didn't work — vendored binary is corrupt
+    or being blocked).
+    """
+    ffmpeg_path = locate_ffmpeg(ffmpeg_path_override)
+    version = _ffmpeg_version(ffmpeg_path)
+
+    hw_proc  = _run([ffmpeg_path, "-hide_banner", "-hwaccels"], timeout=5.0)
+    enc_proc = _run([ffmpeg_path, "-hide_banner", "-encoders"], timeout=5.0)
+    hwaccels = parse_hwaccels(hw_proc.stdout or "")
+    encoders = parse_encoders(enc_proc.stdout or "")
+
+    chosen: Optional[str] = None
+    for cand in _ENCODER_CANDIDATES:
+        if cand not in encoders:
+            continue
+        if try_encoder(ffmpeg_path, cand):
+            chosen = cand
+            break
+    if chosen is None:
+        raise FFmpegProbeError(
+            f"every encoder candidate failed runtime probe (tried "
+            f"{list(_ENCODER_CANDIDATES)}). ffmpeg={ffmpeg_path}"
+        )
+
+    tier = _TIER_FOR_ENCODER[chosen]
+    decoder = _pick_decoder(tier, hwaccels)
+
+    profile = AccelProfile(
+        ffmpeg_path=ffmpeg_path,
+        encoder=chosen,
+        decoder=decoder,
+        tier=tier,
+        available_encoders=encoders,
+        available_hwaccels=hwaccels,
+        ffmpeg_version=version,
+    )
+    log.info(
+        "ffmpeg probe: path=%s version=%s tier=%s encoder=%s decoder=%s",
+        profile.ffmpeg_path, profile.ffmpeg_version,
+        profile.tier, profile.encoder, profile.decoder,
+    )
+    return profile

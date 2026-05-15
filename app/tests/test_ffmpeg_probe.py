@@ -145,3 +145,108 @@ def test_try_encoder_returns_false_on_unexpected_exception(monkeypatch):
         raise OSError("file not found")
     monkeypatch.setattr(ffmpeg_probe, "_run", _raise)
     assert ffmpeg_probe.try_encoder("ffmpeg.exe", "libx264") is False
+
+
+def test_accel_profile_is_immutable():
+    p = ffmpeg_probe.AccelProfile(
+        ffmpeg_path="ff", encoder="libx264", decoder="d3d11va",
+        tier="sw", available_encoders=[], available_hwaccels=[],
+        ffmpeg_version="",
+    )
+    with pytest.raises(Exception):  # FrozenInstanceError subclass
+        p.encoder = "h264_nvenc"  # type: ignore[misc]
+
+
+def test_detect_picks_libx264_when_only_sw_works(monkeypatch, tmp_path):
+    # Stub locate_ffmpeg to return a fake path.
+    fake = tmp_path / "ffmpeg.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(ffmpeg_probe, "locate_ffmpeg", lambda override=None: str(fake))
+    # Stub enumeration: -hwaccels + -encoders + -version. Stub try_encoder to
+    # fail every HW encoder, succeed only libx264.
+    def _stub_run(args, timeout):
+        if "-version" in args:
+            return _completed(0, stdout="ffmpeg version 8.1-test\n")
+        if "-hwaccels" in args:
+            return _completed(0, stdout=_load("ffmpeg_hwaccels.txt"))
+        if "-encoders" in args:
+            return _completed(0, stdout=_load("ffmpeg_encoders.txt"))
+        raise AssertionError(f"unexpected args: {args}")
+    monkeypatch.setattr(ffmpeg_probe, "_run", _stub_run)
+    monkeypatch.setattr(
+        ffmpeg_probe, "try_encoder",
+        lambda path, enc: enc == "libx264",
+    )
+    # Clear the lru_cache before each call so monkeypatches take effect.
+    ffmpeg_probe.detect.cache_clear()
+    profile = ffmpeg_probe.detect()
+    assert profile.encoder == "libx264"
+    assert profile.tier == "sw"
+    assert profile.ffmpeg_path == str(fake)
+    assert profile.decoder == "d3d11va"   # fixtures list d3d11va, sw tier prefers it
+    assert "h264_nvenc" in profile.available_encoders   # enumeration still recorded
+    assert "cuda" in profile.available_hwaccels
+
+
+def test_detect_picks_nvenc_when_available(monkeypatch, tmp_path):
+    fake = tmp_path / "ffmpeg.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(ffmpeg_probe, "locate_ffmpeg", lambda override=None: str(fake))
+    def _stub_run(args, timeout):
+        if "-version" in args:
+            return _completed(0, stdout="ffmpeg version 8.1-test\n")
+        if "-hwaccels" in args:
+            return _completed(0, stdout=_load("ffmpeg_hwaccels.txt"))
+        if "-encoders" in args:
+            return _completed(0, stdout=_load("ffmpeg_encoders.txt"))
+        raise AssertionError
+    monkeypatch.setattr(ffmpeg_probe, "_run", _stub_run)
+    # All HW encoders "work" in this scenario.
+    monkeypatch.setattr(ffmpeg_probe, "try_encoder", lambda path, enc: True)
+    ffmpeg_probe.detect.cache_clear()
+    profile = ffmpeg_probe.detect()
+    assert profile.encoder == "h264_nvenc"   # first in priority
+    assert profile.tier == "nvidia"
+    assert profile.decoder == "cuda"
+
+
+def test_detect_raises_when_every_encoder_fails(monkeypatch, tmp_path):
+    fake = tmp_path / "ffmpeg.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(ffmpeg_probe, "locate_ffmpeg", lambda override=None: str(fake))
+    def _stub_run(args, timeout):
+        if "-version" in args:
+            return _completed(0, stdout="ffmpeg version 8.1-test\n")
+        if "-hwaccels" in args:
+            return _completed(0, stdout="Hardware acceleration methods:\n")
+        if "-encoders" in args:
+            return _completed(0, stdout=_load("ffmpeg_encoders.txt"))
+        raise AssertionError
+    monkeypatch.setattr(ffmpeg_probe, "_run", _stub_run)
+    monkeypatch.setattr(ffmpeg_probe, "try_encoder", lambda path, enc: False)
+    ffmpeg_probe.detect.cache_clear()
+    with pytest.raises(ffmpeg_probe.FFmpegProbeError):
+        ffmpeg_probe.detect()
+
+
+def test_detect_caches_result(monkeypatch, tmp_path):
+    fake = tmp_path / "ffmpeg.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(ffmpeg_probe, "locate_ffmpeg", lambda override=None: str(fake))
+    call_count = {"n": 0}
+    def _stub_run(args, timeout):
+        call_count["n"] += 1
+        if "-version" in args:
+            return _completed(0, stdout="ffmpeg version 8.1-test\n")
+        if "-hwaccels" in args:
+            return _completed(0, stdout=_load("ffmpeg_hwaccels.txt"))
+        if "-encoders" in args:
+            return _completed(0, stdout=_load("ffmpeg_encoders.txt"))
+        return _completed(0)
+    monkeypatch.setattr(ffmpeg_probe, "_run", _stub_run)
+    monkeypatch.setattr(ffmpeg_probe, "try_encoder", lambda path, enc: enc == "libx264")
+    ffmpeg_probe.detect.cache_clear()
+    ffmpeg_probe.detect()
+    after_first = call_count["n"]
+    ffmpeg_probe.detect()
+    assert call_count["n"] == after_first, "detect() should be cached"
