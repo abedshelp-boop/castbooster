@@ -4,22 +4,23 @@ State machine (every observable state is enumerated; no predicate ever
 treats "not active" as "done" — see 2026-04-22 IDLE-race lesson):
 
     IDLE         constructed; start() not yet called
-    SPAWNING     Popen returned; pipes open; no log line yet
-    WARMING      ffmpeg running; output files not yet present
-    READY        >= 2 seg_*.ts + master.m3u8 + variant.m3u8 on disk
-    STREAMING    new segment appeared after READY (cadence healthy)
-    STALLED      STREAMING but no new seg for stall_timeout seconds
-    FAILED       subprocess exited non-zero OR stderr matched fatal pattern
-                 OR warming_timeout elapsed pre-READY
-    TERMINATING  stop() called; q\\n sent to stdin; draining
-    TERMINATED   subprocess reaped + output_dir deleted
+    SPAWNING     _current slot in SPAWNING
+    WARMING      _current slot in WARMING
+    READY        _current slot in READY                            (Chromecast can fetch)
+    STREAMING    _current slot in STREAMING                        (Chromecast can fetch)
+    STALLED      _current slot in STALLED                          (Chromecast can fetch)
+    RELOADING    _current STREAMING/STALLED/READY + _next WARMING  (Chromecast can fetch from _current)
+    FAILED       _current FAILED + _next is None or also FAILED
+    TERMINATING  stop() called; draining both slots
+    TERMINATED   all slots reaped + output dirs deleted
 
-Threading: one stderr-reader thread + one watchdog-poller thread per
-_ProcessSlot. State mutations go through _set_sub_state_locked() under
-_sub_state_lock. _ready_event is set the first time sub_state becomes
-READY or FAILED so wait_until_ready() can block on it cleanly.
+Threading: each _ProcessSlot owns one stderr-reader thread + one
+watchdog-poller thread. Transcoder owns the state lock and the slot refs.
+State mutations go through _set_state_locked() under _state_lock.
 
-P2.3 adds RELOADING — wired in Task 5.
+P2.3 added set_filter_chain(chain) -> bool for hot-reload via
+spawn-new-then-kill-old. RELOADING covers the window where NEW is
+WARMING in <base>/v<N+1>/ while OLD continues serving from <base>/v<N>/.
 """
 from __future__ import annotations
 

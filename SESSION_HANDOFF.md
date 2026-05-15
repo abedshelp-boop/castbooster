@@ -11,6 +11,23 @@ This is the complete memory transfer from the design session that scoped Cast Bo
 - **Current state of product**: **Phase 1 vertical slice SHIPS.** Windows desktop app + Chrome extension + Chrome Native Messaging bridge + session-aware HLS proxy + pychromecast control all working end-to-end. Verified by casting a real HLS stream from `masukestin.com` to a real Chromecast ("Dining room TV"), full HD optimized playback. Session-locked URLs solved. Next work is controls (play/pause/seek/skip in the popup) and then Phase 2 polish (installer, code signing, landing page, payments).
 - **Pillar 2 in progress**: P2.1 (ffmpeg foundation) shipped on branch `pillar-2.1/ffmpeg-foundation`. Spec at `docs/superpowers/specs/2026-05-15-pillar-2.1-ffmpeg-foundation-design.md`; plan at `docs/superpowers/plans/2026-05-15-pillar-2.1-ffmpeg-foundation.md`. Next sub-session: P2.2 (transcoder module).
 - **Pillar 2 in progress**: P2.2 (transcoder module + state machine) shipped. Spec at `docs/superpowers/specs/2026-05-15-pillar-2.2-transcoder-design.md`; plan at `docs/superpowers/plans/2026-05-15-pillar-2.2-transcoder.md`. Module is a leaf (no proxy wiring yet); next sub-session P2.3 builds the filter chain.
+- **Pillar 2 in progress**: P2.3 (filter chain abstraction + hot-reload) shipped on branch `pillar-2.3/filter-chain`. Spec at `docs/superpowers/specs/2026-05-15-pillar-2.3-filter-chain-design.md`; plan at `docs/superpowers/plans/2026-05-15-pillar-2.3-filter-chain.md`. Next sub-session: P2.4 proxy integration — wire `/upstream/*` and `/output/*` routes, gate `_handle_cast` on transcoder READY.
+
+---
+
+## 2026-05-15 — P2.3 complete
+
+Pillar 2 sub-task 3 (filter chain abstraction + NoopFilter + SubtitleBurnIn + hot-reload) shipped on `pillar-2.3/filter-chain`.
+
+- `app/castbooster/filter_chain.py` — FilterStage Protocol, NoopFilter, SubtitleBurnIn, FilterChain
+- `app/castbooster/transcoder.py` — extracted `_ProcessSlot`, added `RELOADING` state, added `set_filter_chain(chain) -> bool` with full reload semantics (promote / demote with `last_reload_error`)
+- 13 filter unit tests + 14 reload unit tests + 2 gated e2e tests; all green
+- P2.2's 22 lifecycle tests preserved through the refactor
+
+Spec: `docs/superpowers/specs/2026-05-15-pillar-2.3-filter-chain-design.md`
+Plan: `docs/superpowers/plans/2026-05-15-pillar-2.3-filter-chain.md`
+
+Next: P2.4 proxy integration — wire `/upstream/*` and `/output/*` routes, escape-hatch env flag, gate `_handle_cast` on transcoder READY.
 
 ---
 

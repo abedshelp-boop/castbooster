@@ -55,6 +55,9 @@ def test_real_transcoder_reaches_ready_within_8s(tmp_path):
         accel=accel,
     )
     t.start()
+    # P2.3: output goes to a versioned subdirectory (out/v1/); capture it
+    # before entering the try block so the finally clause can use it safely.
+    slot_dir = t.output_dir  # resolves to out/v1 after start()
     try:
         ok = t.wait_until_ready(timeout=8.0)
         assert ok, (
@@ -65,10 +68,12 @@ def test_real_transcoder_reaches_ready_within_8s(tmp_path):
             TranscoderState.READY,
             TranscoderState.STREAMING,
         )
-        assert (out / "master.m3u8").exists()
-        assert (out / "variant.m3u8").exists()
-        assert len(list(out.glob("seg_*.ts"))) >= 2
+        assert (slot_dir / "master.m3u8").exists()
+        assert (slot_dir / "variant.m3u8").exists()
+        assert len(list(slot_dir.glob("seg_*.ts"))) >= 2
     finally:
         t.stop()
         assert t.state == TranscoderState.TERMINATED
-        assert not out.exists()
+        # P2.3: Transcoder cleans up the versioned slot dir (out/v1/), not the
+        # caller-supplied base dir. The slot dir must be gone after stop().
+        assert not slot_dir.exists()
