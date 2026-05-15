@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -258,3 +259,35 @@ _MASTER_PLAYLIST = (
     'CODECS="avc1.4d401f,mp4a.40.2"\n'
     "variant.m3u8\n"
 )
+
+# Fatal-pattern table. Each entry is (compiled regex, idle_reason token).
+# Patterns are case-insensitive. Order matters only for documentation;
+# all patterns are tried until one matches.
+_FATAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"No NVENC capable devices found", re.I), "hwaccel_unavailable"),
+    (re.compile(r"nvenc.*not supported", re.I), "hwaccel_unavailable"),
+    (re.compile(r"Cannot load (libcuda|nvcuda)", re.I), "hwaccel_unavailable"),
+    (re.compile(r"qsv.*not (supported|available)", re.I), "hwaccel_unavailable"),
+    (re.compile(r"Connection refused", re.I), "input_unreachable"),
+    (re.compile(r"404 Not Found", re.I), "input_unreachable"),
+    (re.compile(r"HTTP error [45]\d\d", re.I), "input_unreachable"),
+    (re.compile(r"Invalid data found when processing input", re.I), "input_unreachable"),
+    (re.compile(r"Error.*opening encoder", re.I), "encoder_init_failed"),
+    (re.compile(r"Cannot initialize.*encoder", re.I), "encoder_init_failed"),
+    (re.compile(r"Failed to open codec", re.I), "encoder_init_failed"),
+]
+
+
+def _classify_stderr_line(line: str) -> Optional[str]:
+    """Return an idle_reason token if `line` matches a fatal pattern, else None.
+
+    Called from the stderr-reader thread for every line ffmpeg emits.
+    Non-None returns trigger the WARMING/READY/STREAMING/STALLED -> FAILED
+    transition.
+    """
+    if not line:
+        return None
+    for pattern, reason in _FATAL_PATTERNS:
+        if pattern.search(line):
+            return reason
+    return None

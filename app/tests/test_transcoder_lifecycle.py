@@ -313,3 +313,50 @@ def test_start_raises_when_called_twice(tmp_path, sw_profile):
                 t.start()
         finally:
             t.stop()
+
+
+# ---------- _classify_stderr_line --------------------------------------------
+
+def test_classify_stderr_returns_none_for_normal_line():
+    from castbooster.transcoder import _classify_stderr_line
+    assert _classify_stderr_line(
+        "frame=   12 fps= 12 q=21.0 size=      16kB time=00:00:00.96"
+    ) is None
+    assert _classify_stderr_line("") is None
+    assert _classify_stderr_line("Stream mapping:") is None
+
+
+def test_classify_stderr_matches_nvenc_failure():
+    from castbooster.transcoder import _classify_stderr_line
+    assert _classify_stderr_line(
+        "[h264_nvenc @ 0x55] No NVENC capable devices found"
+    ) == "hwaccel_unavailable"
+    assert _classify_stderr_line(
+        "Cannot load nvcuda.dll"
+    ) == "hwaccel_unavailable"
+    assert _classify_stderr_line(
+        "qsv: hardware not supported"
+    ) == "hwaccel_unavailable"
+
+
+def test_classify_stderr_matches_input_failure():
+    from castbooster.transcoder import _classify_stderr_line
+    assert _classify_stderr_line(
+        "http://x/m.m3u8: Connection refused"
+    ) == "input_unreachable"
+    assert _classify_stderr_line(
+        "HTTP error 404 Not Found"
+    ) == "input_unreachable"
+    assert _classify_stderr_line(
+        "Invalid data found when processing input"
+    ) == "input_unreachable"
+
+
+def test_classify_stderr_matches_encoder_init_failure():
+    from castbooster.transcoder import _classify_stderr_line
+    assert _classify_stderr_line(
+        "Error opening encoder for stream 0"
+    ) == "encoder_init_failed"
+    assert _classify_stderr_line(
+        "Failed to open codec libx264"
+    ) == "encoder_init_failed"
