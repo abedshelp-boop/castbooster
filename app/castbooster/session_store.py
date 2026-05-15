@@ -2,7 +2,11 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from castbooster.transcoder import Transcoder
 
 log = logging.getLogger(__name__)
 
@@ -15,6 +19,10 @@ class StreamSession:
     headers: Dict[str, str] = field(default_factory=dict)
     user_agent: str = ""
     created_at: float = field(default_factory=time.time)
+    # NEW in P2.4 — all default None / False so existing tests don't need updates.
+    transcoder: Optional["Transcoder"] = None
+    output_dir: Optional[Path] = None
+    passthrough_only: bool = False
 
 
 class SessionStore:
