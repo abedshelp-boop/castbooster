@@ -416,3 +416,41 @@ def test_warming_to_failed_on_stderr_input_pattern(tmp_path, sw_profile):
             assert t.idle_reason == "input_unreachable"
         finally:
             t.stop()
+
+
+# ---------- WARMING -> READY -------------------------------------------------
+
+def _touch_segment(output_dir: Path, n: int) -> None:
+    """Create a fake seg_NNNNN.ts file with a unique mtime."""
+    seg = output_dir / f"seg_{n:05d}.ts"
+    seg.write_bytes(b"\x00" * 16)
+    # Slight delay so subsequent touches get distinguishable mtimes
+    time.sleep(0.01)
+
+
+def _touch_variant(output_dir: Path, contents: str = "#EXTM3U\n") -> None:
+    (output_dir / "variant.m3u8").write_text(contents, encoding="utf-8")
+
+
+def test_warming_to_ready_when_files_appear(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    out = tmp_path / "out"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=out,
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            # Simulate ffmpeg writing output files
+            _touch_segment(out, 0)
+            _touch_segment(out, 1)
+            _touch_variant(out)
+            assert _wait_for_state(t, TranscoderState.READY, timeout=1.0), \
+                f"state={t.state}"
+        finally:
+            t.stop()

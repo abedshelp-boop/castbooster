@@ -206,11 +206,45 @@ class Transcoder:
         with self._state_lock:
             self._set_state_locked(TranscoderState.TERMINATED)
 
+    def _is_ready_on_disk(self) -> tuple[bool, int]:
+        """Returns (ready, seg_count). Ready iff >= 2 segs AND master AND variant exist."""
+        try:
+            segs = sorted(self._output_dir.glob("seg_*.ts"))
+        except OSError:
+            return False, 0
+        seg_count = len(segs)
+        if seg_count < 2:
+            return False, seg_count
+        if not (self._output_dir / "master.m3u8").exists():
+            return False, seg_count
+        if not (self._output_dir / "variant.m3u8").exists():
+            return False, seg_count
+        return True, seg_count
+
     def _watchdog_poller_loop(self) -> None:
-        """Filled out in Task 8 (READY detection) + Task 9 (timeout) +
-        Task 10 (early-exit) + Tasks 11–12 (STREAMING/STALLED)."""
+        """Drives WARMING -> READY -> STREAMING <-> STALLED + early-exit /
+        timeout failures. Exits when state is FAILED or TERMINATED.
+
+        Later tasks (9, 10, 11, 12) extend this loop. Keep it readable.
+        """
         while not self._stop_requested.is_set():
             time.sleep(self._poll_interval)
+            with self._state_lock:
+                current = self._state
+            if current in (
+                TranscoderState.FAILED,
+                TranscoderState.TERMINATING,
+                TranscoderState.TERMINATED,
+            ):
+                return
+
+            if current == TranscoderState.WARMING:
+                ready, _ = self._is_ready_on_disk()
+                if ready:
+                    with self._state_lock:
+                        if self._state == TranscoderState.WARMING:
+                            self._set_state_locked(TranscoderState.READY)
+                    continue
 
     def _stderr_reader_loop(self) -> None:
         """Drives state -> FAILED on any line matching _FATAL_PATTERNS.
