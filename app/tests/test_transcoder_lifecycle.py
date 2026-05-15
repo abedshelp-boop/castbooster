@@ -708,3 +708,47 @@ def test_stop_kills_after_drain_timeout(tmp_path, sw_profile):
         assert t.state == TranscoderState.TERMINATED
         assert fake.poll() == -9, "kill() should set exit code to -9"
         assert elapsed < 2.0, f"stop() took {elapsed:.2f}s — escalation too slow"
+
+
+# ---------- stop() idempotence + idle_reason preservation --------------------
+
+def test_stop_idempotent(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        threading.Thread(target=lambda: (time.sleep(0.05), fake.set_exit(0)),
+                         daemon=True).start()
+        t.stop(drain_seconds=1.0)
+        # Second stop() must not crash, must leave state == TERMINATED
+        t.stop()
+        t.stop()
+        assert t.state == TranscoderState.TERMINATED
+
+
+def test_failed_keeps_idle_reason_after_stop(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+        fake.queue_stderr("No NVENC capable devices found")
+        assert _wait_for_state(t, TranscoderState.FAILED, timeout=1.0)
+        assert t.idle_reason == "hwaccel_unavailable"
+        threading.Thread(target=lambda: (time.sleep(0.05), fake.set_exit(1)),
+                         daemon=True).start()
+        t.stop(drain_seconds=1.0)
+        assert t.state == TranscoderState.TERMINATED
+        assert t.idle_reason == "hwaccel_unavailable"   # preserved
