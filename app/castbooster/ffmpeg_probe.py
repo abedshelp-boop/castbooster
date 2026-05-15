@@ -229,7 +229,7 @@ def _ffmpeg_version(ffmpeg_path: str) -> str:
     only and not load-bearing.
     """
     try:
-        r = _run([ffmpeg_path, "-hide_banner", "-version"], timeout=5.0)
+        r = _run([ffmpeg_path, "-hide_banner", "-version"], timeout=_PROBE_TIMEOUT)
         first = (r.stdout or "").splitlines()[0] if r.stdout else ""
         tokens = first.split()
         # "ffmpeg version 8.1-full_build-www.gyan.dev Copyright (c) ..."

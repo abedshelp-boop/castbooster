@@ -153,7 +153,9 @@ def test_accel_profile_is_immutable():
         tier="sw", available_encoders=[], available_hwaccels=[],
         ffmpeg_version="",
     )
-    with pytest.raises(Exception):  # FrozenInstanceError subclass
+    # dataclasses.FrozenInstanceError is a subclass of AttributeError, but
+    # asserting on AttributeError keeps the test robust across Python versions.
+    with pytest.raises(AttributeError):
         p.encoder = "h264_nvenc"  # type: ignore[misc]
 
 
