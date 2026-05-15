@@ -529,3 +529,59 @@ def test_ready_to_streaming_on_new_seg(tmp_path, sw_profile):
                 f"state={t.state}"
         finally:
             t.stop()
+
+
+# ---------- STREAMING <-> STALLED --------------------------------------------
+
+def test_streaming_to_stalled_on_quiet(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    out = tmp_path / "out"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=out,
+            accel=sw_profile,
+            stall_timeout=0.25,        # tight: stall fast
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            _touch_segment(out, 0); _touch_segment(out, 1); _touch_variant(out)
+            assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+            _touch_segment(out, 2)
+            assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0)
+            # Now no new segs → STALLED after stall_timeout
+            assert _wait_for_state(t, TranscoderState.STALLED, timeout=1.0), \
+                f"state={t.state}"
+        finally:
+            t.stop()
+
+
+def test_stalled_recovers_to_streaming(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    out = tmp_path / "out"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=out,
+            accel=sw_profile,
+            stall_timeout=0.25,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            _touch_segment(out, 0); _touch_segment(out, 1); _touch_variant(out)
+            assert _wait_for_state(t, TranscoderState.READY, timeout=1.0)
+            _touch_segment(out, 2)
+            assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0)
+            assert _wait_for_state(t, TranscoderState.STALLED, timeout=1.0)
+            # New seg → back to STREAMING
+            _touch_segment(out, 3)
+            assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.0), \
+                f"state={t.state}"
+        finally:
+            t.stop()

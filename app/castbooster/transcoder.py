@@ -309,6 +309,30 @@ class Transcoder:
                             self._last_new_seg_monotonic = time.monotonic()
                     continue
 
+            if current == TranscoderState.STREAMING:
+                _, seg_count = self._is_ready_on_disk()
+                if seg_count > self._last_seg_count:
+                    self._last_seg_count = seg_count
+                    self._last_new_seg_monotonic = time.monotonic()
+                elif (
+                    time.monotonic() - self._last_new_seg_monotonic
+                    > self._stall_timeout
+                ):
+                    with self._state_lock:
+                        if self._state == TranscoderState.STREAMING:
+                            self._set_state_locked(TranscoderState.STALLED)
+                continue
+
+            if current == TranscoderState.STALLED:
+                _, seg_count = self._is_ready_on_disk()
+                if seg_count > self._last_seg_count:
+                    self._last_seg_count = seg_count
+                    self._last_new_seg_monotonic = time.monotonic()
+                    with self._state_lock:
+                        if self._state == TranscoderState.STALLED:
+                            self._set_state_locked(TranscoderState.STREAMING)
+                continue
+
     def _stderr_reader_loop(self) -> None:
         """Drives state -> FAILED on any line matching _FATAL_PATTERNS.
 
