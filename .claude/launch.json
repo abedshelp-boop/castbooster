@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Cast Booster (Python tray + aiohttp proxy)",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/C", "app\\scripts\\run_dev.bat"],
+      "port": 38123
+    },
+    {
+      "name": "Popup preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "5713", "--directory", "extension", "--bind", "127.0.0.1"],
+      "port": 5713
+    }
+  ]
+}

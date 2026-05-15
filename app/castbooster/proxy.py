@@ -1,0 +1,644 @@
+import asyncio
+import logging
+import threading
+from typing import Any, Awaitable, Callable, Dict, Optional
+from urllib.parse import urlparse
+
+import yarl
+from aiohttp import ClientSession, ClientTimeout, web
+
+from castbooster import __version__
+from castbooster.caster import CastManager
+from castbooster.hls_rewriter import decode_url, rewrite_playlist
+from castbooster.netinfo import get_lan_ip
+from castbooster.session_store import SessionStore, StreamSession
+
+log = logging.getLogger(__name__)
+
+PROXY_HOST = "0.0.0.0"
+PROXY_PORT = 38123
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+)
+
+# Headers we forward from the Chromecast's request up to the CDN.
+_FORWARD_REQ_HEADERS = ("range",)
+# Headers we copy from the CDN response back to the Chromecast.
+_FORWARD_RESP_HEADERS = (
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "cache-control",
+    "etag",
+    "last-modified",
+)
+
+_PLAYLIST_CONTENT_TYPES = ("mpegurl", "dash+xml")
+
+# Chromecast's Default Media Receiver loads from gstatic.com and fetches
+# our proxied URLs via MSE from a different origin. Without these CORS
+# headers the receiver's Chromium sandbox silently rejects the response
+# and the TV spins forever.
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "*",
+}
+
+
+NMHandler = Callable[[web.Application, dict], Awaitable[dict]]
+
+
+class ProxyHandle:
+    """Holds references to the proxy loop + shutdown event so the main thread
+    can signal a clean shutdown from outside the loop."""
+
+    def __init__(self) -> None:
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self._shutdown: Optional[asyncio.Event] = None
+        self.thread: Optional[threading.Thread] = None
+        self.lan_ip: str = ""
+        # Signalled by the proxy thread once TCPSite.start() has bound the
+        # port (success) OR the run crashed (failure). Main thread blocks on
+        # this briefly so we can exit if bind failed instead of running a
+        # tray icon with no proxy behind it.
+        self._ready: threading.Event = threading.Event()
+        self.bind_failed: bool = False
+
+    def wait_ready(self, timeout: float) -> bool:
+        """Block until the proxy has bound the port or failed trying.
+        Returns True if bound successfully, False on timeout or bind failure.
+        """
+        if not self._ready.wait(timeout):
+            return False
+        return not self.bind_failed
+
+    def stop(self) -> None:
+        if self.loop and self._shutdown and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._shutdown.set)
+        if self.thread:
+            self.thread.join(timeout=5)
+
+
+async def _handle_ping(app: web.Application, _msg: dict) -> dict:
+    return {"type": "pong", "version": __version__, "lanIp": app["lan_ip"]}
+
+
+async def _handle_not_implemented(_app: web.Application, msg: dict) -> dict:
+    return {
+        "type": "error",
+        "detail": f"'{msg.get('type')}' not implemented yet",
+    }
+
+
+async def _handle_list_casts(app: web.Application, _msg: dict) -> dict:
+    cm: CastManager = app["cast_manager"]
+    loop = asyncio.get_running_loop()
+    casts = await loop.run_in_executor(None, cm.list_devices)
+    return {"type": "casts", "casts": casts}
+
+
+async def _handle_cast(app: web.Application, msg: dict) -> dict:
+    token = msg.get("token")
+    cast_uuid = msg.get("castUuid")
+    if not token or not isinstance(token, str):
+        return {"type": "casting", "status": "error", "detail": "missing 'token'"}
+    if not cast_uuid or not isinstance(cast_uuid, str):
+        return {"type": "casting", "status": "error", "detail": "missing 'castUuid'"}
+    store: SessionStore = app["session_store"]
+    sess = store.get(token)
+    if sess is None:
+        return {"type": "casting", "status": "error", "detail": "unknown token"}
+
+    path_seg, content_type = _guess_manifest_path(sess.upstream_url)
+    playback_url = f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/{path_seg}"
+
+    cm: CastManager = app["cast_manager"]
+    loop = asyncio.get_running_loop()
+    try:
+        name = await loop.run_in_executor(
+            None, cm.play, cast_uuid, playback_url, content_type
+        )
+    except LookupError as e:
+        return {"type": "casting", "status": "error", "detail": str(e)}
+    except Exception as e:
+        log.exception("cast play_media failed")
+        return {"type": "casting", "status": "error", "detail": f"play_media failed: {e}"}
+    return {
+        "type": "casting",
+        "status": "ok",
+        "detail": f"Playback started on {name}",
+        "playbackUrl": playback_url,
+    }
+
+
+def _guess_manifest_path(url: str) -> tuple[str, str]:
+    """Return (path_segment, content_type) based on URL shape.
+
+    path_segment is what lives after the session token in the playback URL,
+    e.g. master.m3u8 / manifest.mpd / video.mp4. Keeping the extension right
+    helps Chromecast sniff the format when our Content-Type header gets lost.
+    """
+    lower = url.lower()
+    if ".m3u8" in lower or ".urlset/" in lower:
+        return "master.m3u8", "application/vnd.apple.mpegurl"
+    if ".mpd" in lower:
+        return "manifest.mpd", "application/dash+xml"
+    if ".webm" in lower:
+        return "video.webm", "video/webm"
+    if ".mp4" in lower:
+        return "video.mp4", "video/mp4"
+    return "video.mp4", "video/mp4"
+
+
+async def _handle_register_stream(app: web.Application, msg: dict) -> dict:
+    url = msg.get("url")
+    if not isinstance(url, str) or not url:
+        return {"type": "error", "detail": "missing 'url'"}
+    cookies = msg.get("cookies") or []
+    headers = msg.get("headers") or {}
+    user_agent = msg.get("userAgent") or ""
+    if not isinstance(cookies, list):
+        return {"type": "error", "detail": "'cookies' must be a list"}
+    if not isinstance(headers, dict):
+        return {"type": "error", "detail": "'headers' must be an object"}
+
+    store: SessionStore = app["session_store"]
+    sess = store.create(url, cookies, headers, user_agent)
+    path_seg, content_type = _guess_manifest_path(url)
+    playback_url = (
+        f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/{path_seg}"
+    )
+    return {
+        "type": "stream_registered",
+        "token": sess.token,
+        "playbackUrl": playback_url,
+        "contentType": content_type,
+    }
+
+
+async def _handle_media_cmd(app: web.Application, msg: dict) -> dict:
+    uuid = msg.get("castUuid")
+    action = msg.get("action")
+    if not uuid or not isinstance(uuid, str):
+        return {"type": "media_cmd_result", "status": "error", "detail": "missing castUuid"}
+    if not action or not isinstance(action, str):
+        return {"type": "media_cmd_result", "status": "error", "detail": "missing action"}
+    cm: CastManager = app["cast_manager"]
+    loop = asyncio.get_running_loop()
+    seconds = msg.get("seconds")
+    delta = msg.get("delta")
+    volume = msg.get("volume")
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: cm.control(uuid, action, seconds=seconds, delta=delta, volume=volume),
+        )
+    except LookupError as e:
+        return {"type": "media_cmd_result", "status": "error", "detail": str(e)}
+    except ValueError as e:
+        return {"type": "media_cmd_result", "status": "error", "detail": str(e)}
+    except Exception as e:
+        log.exception("media_cmd failed: action=%s uuid=%s", action, uuid)
+        return {"type": "media_cmd_result", "status": "error", "detail": str(e)}
+    return {"type": "media_cmd_result", "status": "ok"}
+
+
+async def _handle_media_status(app: web.Application, msg: dict) -> dict:
+    uuid = msg.get("castUuid")
+    if not uuid or not isinstance(uuid, str):
+        return {
+            "type": "media_status_result",
+            "state": "IDLE",
+            "currentTime": 0,
+            "duration": 0,
+            "title": "",
+            "canSeek": False,
+            "error": "missing castUuid",
+        }
+    cm: CastManager = app["cast_manager"]
+    loop = asyncio.get_running_loop()
+    try:
+        status = await loop.run_in_executor(None, cm.get_status, uuid)
+    except LookupError:
+        # No active session — popup interprets this as "cast ended".
+        return {
+            "type": "media_status_result",
+            "state": "IDLE",
+            "currentTime": 0,
+            "duration": 0,
+            "title": "",
+            "canSeek": False,
+            "castUuid": uuid,
+        }
+    except Exception as e:
+        log.exception("media_status failed: uuid=%s", uuid)
+        return {
+            "type": "media_status_result",
+            "state": "IDLE",
+            "currentTime": 0,
+            "duration": 0,
+            "title": "",
+            "canSeek": False,
+            "castUuid": uuid,
+            "error": str(e),
+        }
+    status["type"] = "media_status_result"
+    status["castUuid"] = uuid
+    # Device name lookup — handy for the popup title/subtitle.
+    try:
+        devices = await loop.run_in_executor(None, cm.list_devices)
+        for d in devices:
+            if d.get("uuid") == uuid:
+                status["deviceName"] = d.get("name", "")
+                break
+    except Exception:
+        log.debug("device lookup during media_status failed", exc_info=True)
+    return status
+
+
+def _default_handlers() -> Dict[str, NMHandler]:
+    return {
+        "ping": _handle_ping,
+        "register_stream": _handle_register_stream,
+        "list_casts": _handle_list_casts,
+        "cast": _handle_cast,
+        "media_cmd": _handle_media_cmd,
+        "media_status": _handle_media_status,
+    }
+
+
+async def _health(request: web.Request) -> web.Response:
+    return web.json_response(
+        {"ok": True, "version": __version__, "lanIp": request.app["lan_ip"]}
+    )
+
+
+def _cookies_for_host(cookie_list, host: str) -> Dict[str, str]:
+    """Filter the session's cookie list to only those whose domain matches
+    `host` (exact or parent-domain). Returns a name->value dict suitable for
+    aiohttp.ClientSession's `cookies` kwarg.
+    """
+    host = (host or "").lower()
+    out: Dict[str, str] = {}
+    for c in cookie_list or []:
+        d = (c.get("domain") or "").lstrip(".").lower()
+        if not d or not c.get("name"):
+            continue
+        if host == d or host.endswith("." + d):
+            out[c["name"]] = c["value"]
+    return out
+
+
+def _build_upstream_headers(
+    sess: StreamSession, client_headers: Dict[str, str], for_playlist: bool
+) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    for k, v in (sess.headers or {}).items():
+        if k and v:
+            headers[k] = v
+    headers["User-Agent"] = sess.user_agent or DEFAULT_UA
+    if for_playlist:
+        # We must regex-rewrite playlists, so force uncompressed.
+        headers["Accept-Encoding"] = "identity"
+    # Forward Range (fMP4 seek, Chromecast probe) to upstream.
+    for h in _FORWARD_REQ_HEADERS:
+        v = client_headers.get(h) or client_headers.get(h.title())
+        if v:
+            headers["Range"] = v
+    return headers
+
+
+def _looks_like_playlist(target_url: str, content_type: str) -> bool:
+    ct = (content_type or "").lower()
+    if any(sig in ct for sig in _PLAYLIST_CONTENT_TYPES):
+        return True
+    low = target_url.lower()
+    if low.endswith(".m3u8") or low.endswith(".mpd"):
+        return True
+    if ".urlset/" in low:
+        # Smashystream-family playlists often have .txt extensions.
+        # Body-sniff in _proxy_fetch filters out segments that share the
+        # .urlset/ path prefix (see _is_playlist_body).
+        return True
+    return False
+
+
+# Playlist magic bytes — HLS manifests start with #EXTM3U, DASH MPD with
+# <MPD or <?xml. Anything else is treated as a media segment even if the
+# URL heuristic said "maybe playlist".
+def _is_playlist_body(head: bytes) -> bool:
+    head = head.lstrip(b"\xef\xbb\xbf")  # strip UTF-8 BOM
+    return head.startswith((b"#EXTM3U", b"<MPD", b"<?xml"))
+
+
+# Chromecast's Default Media Receiver will refuse a response whose Content-Type
+# is clearly non-video (font/*, image/*, application/octet-stream). Some origins
+# serve HLS segments under disguised extensions (.woff2, .image) with the
+# matching bogus content-type to dodge filters. When we recognise this pattern,
+# substitute a sensible video content-type so the receiver will decode it.
+_BAD_SEG_CT_PREFIXES = ("font/", "image/", "application/font-", "application/octet-stream")
+
+
+def _infer_segment_content_type(target_url: str, upstream_ct: str) -> str:
+    """Return the Content-Type to send the Chromecast for a media segment.
+
+    If upstream's content-type is sensible (video/* / audio/*), pass it through.
+    Otherwise infer from the URL extension and default to video/mp2t inside a
+    .urlset/ HLS context (which is always MPEG-TS for v3 playlists).
+    """
+    upstream_ct = (upstream_ct or "").split(";")[0].strip().lower()
+    if upstream_ct and not upstream_ct.startswith(_BAD_SEG_CT_PREFIXES):
+        return upstream_ct
+    low = target_url.lower().split("?", 1)[0]
+    if low.endswith(".ts"):
+        return "video/mp2t"
+    if low.endswith(".m4s"):
+        return "video/iso.segment"
+    if low.endswith(".mp4"):
+        return "video/mp4"
+    if low.endswith(".webm"):
+        return "video/webm"
+    if low.endswith(".aac"):
+        return "audio/aac"
+    # .urlset/ HLS v3 segments are MPEG-TS regardless of the disguised extension.
+    if ".urlset/" in low:
+        return "video/mp2t"
+    return upstream_ct or "application/octet-stream"
+
+
+async def _proxy_fetch(
+    request: web.Request, sess: StreamSession, target_url: str
+) -> web.StreamResponse:
+    client: ClientSession = request.app["http_client"]
+    parsed = urlparse(target_url)
+    cookies = _cookies_for_host(sess.cookies, parsed.hostname or "")
+    # First attempt: assume non-playlist and send Range if present. If the CDN
+    # is a playlist, we'll detect via Content-Type and switch to buffered+rewrite.
+    upstream_headers = _build_upstream_headers(sess, dict(request.headers), for_playlist=False)
+    log.info(
+        "proxy fetch: url=%s cookies=%d range=%r",
+        target_url[:140],
+        len(cookies),
+        upstream_headers.get("Range"),
+    )
+    # yarl.URL(encoded=True) disables aiohttp's query-string normalization,
+    # which otherwise decodes %2F → '/' and breaks signed-URL CDN checks
+    # (e.g. tiktok ad segments with x-signature=...%2F...).
+    try:
+        resp = await client.get(
+            yarl.URL(target_url, encoded=True),
+            cookies=cookies,
+            headers=upstream_headers,
+            allow_redirects=True,
+            timeout=ClientTimeout(total=60),
+        )
+    except Exception as e:
+        log.exception("upstream fetch failed for %s", target_url[:140])
+        return web.Response(status=502, text=f"upstream fetch failed: {e}")
+
+    try:
+        ct = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if _looks_like_playlist(target_url, ct):
+            # Buffer and sniff — the .urlset/ URL heuristic also matches media
+            # segments that live under the same path, and decoding their bytes
+            # as text then running rewrite_playlist crashes urljoin on the
+            # binary noise (saw "Invalid IPv6 URL" in the wild).
+            body_bytes = await resp.read()
+            if _is_playlist_body(body_bytes[:16]):
+                body = body_bytes.decode("utf-8", errors="replace")
+                proxy_base = f"http://{request.app['lan_ip']}:{PROXY_PORT}"
+                rewritten = rewrite_playlist(body, target_url, sess.token, proxy_base)
+                out_ct = ct or "application/vnd.apple.mpegurl"
+                preview = "\\n".join(rewritten.splitlines()[:10])
+                log.info(
+                    "proxy: rewrote playlist (%d -> %d bytes) ct=%s status=%s preview=%s",
+                    len(body),
+                    len(rewritten),
+                    out_ct,
+                    resp.status,
+                    preview[:400],
+                )
+                headers = {
+                    "Content-Type": f"{out_ct}; charset=utf-8",
+                    "Cache-Control": "no-store",
+                    **_CORS_HEADERS,
+                }
+                return web.Response(
+                    body=rewritten.encode("utf-8"),
+                    status=resp.status,
+                    headers=headers,
+                )
+            # URL said playlist but body is binary — fall through to serving
+            # the buffered bytes as a segment (with content-type correction).
+            seg_ct = _infer_segment_content_type(target_url, ct)
+            log.info(
+                "proxy: urlset segment served as %s (upstream ct=%s, %d bytes, url=%s)",
+                seg_ct,
+                ct or "?",
+                len(body_bytes),
+                target_url[:120],
+            )
+            headers: Dict[str, str] = {}
+            for name in _FORWARD_RESP_HEADERS:
+                if name.lower() == "content-type":
+                    continue
+                v = resp.headers.get(name)
+                if v:
+                    headers[name.title()] = v
+            headers["Content-Type"] = seg_ct
+            headers.setdefault("Accept-Ranges", "bytes")
+            for k, v in _CORS_HEADERS.items():
+                headers[k] = v
+            return web.Response(body=body_bytes, status=resp.status, headers=headers)
+
+        # Media bytes — stream through.
+        out = web.StreamResponse(status=resp.status)
+        for name in _FORWARD_RESP_HEADERS:
+            if name.lower() == "content-type":
+                continue
+            v = resp.headers.get(name)
+            if v:
+                out.headers[name.title()] = v
+        out.headers["Content-Type"] = _infer_segment_content_type(target_url, ct)
+        out.headers.setdefault("Accept-Ranges", "bytes")
+        for k, v in _CORS_HEADERS.items():
+            out.headers[k] = v
+        log.info(
+            "proxy: streaming %s status=%s upstream_ct=%s served_ct=%s",
+            target_url[:120],
+            resp.status,
+            resp.headers.get("Content-Type", "?"),
+            out.headers["Content-Type"],
+        )
+        await out.prepare(request)
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            await out.write(chunk)
+        await out.write_eof()
+        return out
+    finally:
+        resp.release()
+
+
+async def _handle_options(request: web.Request) -> web.Response:
+    """Chromecast's sandbox may issue CORS preflights for our proxy URLs.
+    Answer them without forwarding anywhere.
+    """
+    return web.Response(status=204, headers=_CORS_HEADERS)
+
+
+async def _handle_entry(request: web.Request) -> web.StreamResponse:
+    """Entry route for a registered session — hits the upstream URL that was
+    originally registered. Path suffix (master.m3u8 / video.mp4 / ...) is
+    cosmetic; the real behavior is content-type driven.
+    """
+    token = request.match_info["token"]
+    sess = request.app["session_store"].get(token)
+    if not sess:
+        return web.Response(status=404, text="unknown or expired token")
+    return await _proxy_fetch(request, sess, sess.upstream_url)
+
+
+async def _handle_fetch(request: web.Request) -> web.StreamResponse:
+    """Nested fetch — the `u` query param is the base64url-encoded upstream URL
+    the playlist originally pointed at. Chromecast hits this for every segment
+    and every nested variant playlist.
+    """
+    token = request.match_info["token"]
+    sess = request.app["session_store"].get(token)
+    if not sess:
+        return web.Response(status=404, text="unknown or expired token")
+    u = request.query.get("u")
+    if not u:
+        return web.Response(status=400, text="missing u")
+    try:
+        target_url = decode_url(u)
+    except Exception:
+        return web.Response(status=400, text="bad u")
+    return await _proxy_fetch(request, sess, target_url)
+
+
+async def _nm(request: web.Request) -> web.Response:
+    try:
+        msg = await request.json()
+    except Exception as e:
+        return web.json_response(
+            {"type": "error", "detail": f"invalid JSON: {e}"}, status=400
+        )
+    if not isinstance(msg, dict) or "type" not in msg:
+        return web.json_response(
+            {"type": "error", "detail": "missing 'type'"}, status=400
+        )
+    handlers: Dict[str, NMHandler] = request.app["nm_handlers"]
+    handler = handlers.get(msg["type"])
+    if handler is None:
+        return web.json_response(
+            {"type": "error", "detail": f"unknown type '{msg['type']}'"}
+        )
+    try:
+        resp = await handler(request.app, msg)
+    except Exception as e:
+        log.exception("nm handler for %s crashed", msg["type"])
+        return web.json_response({"type": "error", "detail": str(e)})
+    return web.json_response(resp)
+
+
+async def _on_startup(app: web.Application) -> None:
+    # ClientSession must be created inside the loop that will use it.
+    app["http_client"] = ClientSession()
+    cm = CastManager()
+    cm.start()
+    # Hand the proxy thread's event loop to the manager so it can spawn
+    # WiFi-radio keepalive tasks from caster.py executor threads.
+    cm.attach_loop(asyncio.get_running_loop())
+    app["cast_manager"] = cm
+
+
+async def _on_cleanup(app: web.Application) -> None:
+    client: Optional[ClientSession] = app.get("http_client")
+    if client is not None:
+        await client.close()
+    cm: Optional[CastManager] = app.get("cast_manager")
+    if cm is not None:
+        # Discovery stop can block briefly on socket close; run off-loop.
+        await asyncio.get_running_loop().run_in_executor(None, cm.stop)
+
+
+def _build_app(lan_ip: str) -> web.Application:
+    app = web.Application()
+    app["lan_ip"] = lan_ip
+    app["session_store"] = SessionStore()
+    app["nm_handlers"] = _default_handlers()
+    app.router.add_get("/health", _health)
+    app.router.add_post("/nm", _nm)
+    # Entry routes for registered streams. Path suffix is cosmetic — Chromecast
+    # uses it as a hint, we serve whatever the session's upstream really is.
+    # (aiohttp's add_get already auto-handles HEAD, so we only register OPTIONS
+    # explicitly for CORS preflight.)
+    for path in ("/s/{token}/master.m3u8", "/s/{token}/manifest.mpd",
+                 "/s/{token}/video.mp4", "/s/{token}/video.webm",
+                 "/s/{token}/video"):
+        app.router.add_get(path, _handle_entry)
+        app.router.add_route("OPTIONS", path, _handle_options)
+    # Nested fetch (segments, variant playlists, init segments, keys).
+    app.router.add_get("/s/{token}/fetch", _handle_fetch)
+    app.router.add_route("OPTIONS", "/s/{token}/fetch", _handle_options)
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+    return app
+
+
+async def _run_server(
+    lan_ip: str,
+    shutdown: asyncio.Event,
+    on_bound: Callable[[], None],
+) -> web.Application:
+    app = _build_app(lan_ip)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, PROXY_HOST, PROXY_PORT)
+    try:
+        await site.start()
+    except OSError as e:
+        log.error("proxy bind failed on %s:%d — %s", PROXY_HOST, PROXY_PORT, e)
+        raise
+    log.info("proxy listening on %s:%d (LAN %s)", PROXY_HOST, PROXY_PORT, lan_ip)
+    on_bound()
+    try:
+        await shutdown.wait()
+    finally:
+        log.info("proxy shutting down")
+        await runner.cleanup()
+    return app
+
+
+def start_proxy(on_ready: Optional[Callable[[str], None]] = None) -> ProxyHandle:
+    handle = ProxyHandle()
+
+    def _thread() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        handle.loop = loop
+        handle._shutdown = asyncio.Event()
+        handle.lan_ip = get_lan_ip()
+        if on_ready:
+            on_ready(handle.lan_ip)
+        try:
+            loop.run_until_complete(
+                _run_server(handle.lan_ip, handle._shutdown, handle._ready.set)
+            )
+        except Exception:
+            log.exception("proxy thread crashed")
+            handle.bind_failed = True
+            handle._ready.set()
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=_thread, name="castbooster-proxy", daemon=True)
+    t.start()
+    handle.thread = t
+    return handle

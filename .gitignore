@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+
+# PyInstaller
+*.manifest
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs / local state
+*.log
+app/castbooster.log
+
+# Native messaging manifest file written at registration time
+app/scripts/com.castbooster.host.generated.json
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Per-developer Claude Code settings (permissions, etc.)
+.claude/settings.local.json

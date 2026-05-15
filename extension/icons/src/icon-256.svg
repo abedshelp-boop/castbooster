@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d1726"/>
+      <stop offset="0.55" stop-color="#06090f"/>
+      <stop offset="1" stop-color="#020306"/>
+    </linearGradient>
+    <linearGradient id="plateShine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7FCFFF" stop-opacity="0.20"/>
+      <stop offset="0.5" stop-color="#7FCFFF" stop-opacity="0"/>
+      <stop offset="1" stop-color="#7FCFFF" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="bloomAz" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#7FCFFF" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#3FA3FF" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#3FA3FF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="azureStroke" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9BD7FF"/>
+      <stop offset="1" stop-color="#1E90FF"/>
+    </linearGradient>
+    <filter id="azGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="azGlowSoft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#plate)" stroke="#1a2940" stroke-width="1.5"/>
+  <rect x="8" y="8" width="240" height="140" rx="52" fill="url(#plateShine)"/>
+  <circle cx="128" cy="130" r="78" fill="url(#bloomAz)"/>
+  <g filter="url(#azGlowSoft)" opacity=".75">
+    <rect x="60" y="60" width="136" height="136" rx="8" transform="rotate(45 128 128)" fill="none" stroke="#3FA3FF" stroke-width="3"/>
+  </g>
+  <rect x="60" y="60" width="136" height="136" rx="8" transform="rotate(45 128 128)" fill="none" stroke="url(#azureStroke)" stroke-width="6" stroke-linejoin="round"/>
+  <rect x="78" y="78" width="100" height="100" rx="4" transform="rotate(45 128 128)" fill="none" stroke="#C7E5FF" stroke-width="2" stroke-linejoin="round" opacity=".7"/>
+  <g stroke="#7FCFFF" stroke-width="4" stroke-linecap="round" fill="none">
+    <path d="M40 60 L40 40 L60 40"/>
+    <path d="M216 60 L216 40 L196 40"/>
+    <path d="M40 196 L40 216 L60 216"/>
+    <path d="M216 196 L216 216 L196 216"/>
+  </g>
+  <circle cx="128" cy="128" r="18" fill="#3FA3FF" filter="url(#azGlow)"/>
+  <circle cx="128" cy="128" r="11" fill="#E6F4FF"/>
+</svg>
