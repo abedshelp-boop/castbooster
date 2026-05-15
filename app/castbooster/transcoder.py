@@ -59,6 +59,7 @@ class TranscoderState(Enum):
     READY = "ready"
     STREAMING = "streaming"
     STALLED = "stalled"
+    RELOADING = "reloading"
     FAILED = "failed"
     TERMINATING = "terminating"
     TERMINATED = "terminated"
@@ -455,6 +456,7 @@ class Transcoder:
         self._current: Optional[_ProcessSlot] = None
         self._next: Optional[_ProcessSlot] = None      # Task 6 populates this
         self._slot_counter: int = 0                    # Task 6 increments this
+        self._last_reload_error: Optional[str] = None
 
     # ---- public properties ----
     @property
@@ -484,6 +486,15 @@ class Transcoder:
     @property
     def master_playlist(self) -> Path:
         return self.output_dir / "master.m3u8"
+
+    @property
+    def last_reload_error(self) -> Optional[str]:
+        """The idle_reason from the most recent failed set_filter_chain() call.
+
+        Cleared on the next successful reload. Survives across multiple failed
+        reloads — only the most recent reason is exposed.
+        """
+        return self._last_reload_error
 
     # ---- lifecycle ----
     def start(self) -> None:
@@ -631,6 +642,7 @@ _FATAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"Error.*opening encoder", re.I), "encoder_init_failed"),
     (re.compile(r"Cannot initialize.*encoder", re.I), "encoder_init_failed"),
     (re.compile(r"Failed to open codec", re.I), "encoder_init_failed"),
+    (re.compile(r"Stream specifier.*matches no streams", re.I), "subtitle_stream_missing"),
 ]
 
 
