@@ -11,6 +11,18 @@ session-locked streaming site to a real Chromecast.
 Phase 2+ adds the installer, code signing, auto-update, landing page, payments,
 and onboarding. See `SESSION_HANDOFF.md` for the full product vision.
 
+## Setup (one-time)
+
+After cloning, fetch the vendored ffmpeg binary (not committed to git — too large):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File app\scripts\fetch_ffmpeg.ps1
+```
+
+This downloads BtbN ffmpeg + ffprobe (~250 MB total) into `app/castbooster/bin/`,
+verifies the sha256 pinned in the script, and runs a smoke test. Uses PowerShell's
+native `Expand-Archive` for the .zip — no 7-Zip needed.
+
 ## Repo layout
 
 | Path | What |
