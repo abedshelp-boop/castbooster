@@ -5,7 +5,11 @@
 ::         + audio (1kHz sine wave) using lavfi virtual inputs.
 :: Step 2: Re-segment that HLS through a no-op video filter (-vf "null") and
 ::         AAC audio passthrough, mirroring what the P2 transcoder will do.
-:: Step 3: Open the result in VLC for visual confirmation.
+:: Step 3: Open the result in ffplay (universal HLS/TS support) for visual
+::         confirmation. Falls back to OS default association only if ffplay
+::         isn't on PATH. Windows' Movies & TV app refuses .ts segments with
+::         "0x80004005" even when the file is perfect, so we deliberately
+::         avoid the default association unless ffplay isn't installed.
 
 setlocal
 set "SRC=%TEMP%\castbooster_spike\src"
@@ -40,9 +44,18 @@ ffmpeg -y -hide_banner -loglevel warning ^
        -f hls "%OUT%\master.m3u8"
 if errorlevel 1 (echo re-segment failed & exit /b 1)
 
-:: ---------- step 3: open in VLC ----------
-echo === [3/3] Opening output in default player ===
-start "" "%OUT%\master.m3u8"
+:: ---------- step 3: play with a player that actually handles MPEG-TS ----------
+:: Prefer ffplay (ships with ffmpeg-full builds — universal HLS/TS support).
+:: Fall back to the OS default association only if ffplay isn't on PATH.
+echo === [3/3] Playing output ===
+where ffplay >nul 2>&1
+if errorlevel 1 (
+    echo ffplay not found on PATH — handing off to OS default ^(may fail on Movies ^& TV^).
+    start "" "%OUT%\master.m3u8"
+) else (
+    echo Launching ffplay — closes automatically after the 10s clip.
+    ffplay -autoexit -loglevel warning "%OUT%\master.m3u8"
+)
 
 echo Done. Output dir: %OUT%
 endlocal
