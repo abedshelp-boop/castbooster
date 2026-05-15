@@ -360,3 +360,59 @@ def test_classify_stderr_matches_encoder_init_failure():
     assert _classify_stderr_line(
         "Failed to open codec libx264"
     ) == "encoder_init_failed"
+
+
+# ---------- WARMING -> FAILED via stderr --------------------------------------
+
+def _wait_for_state(t, target, timeout=2.0):
+    """Helper: poll until state matches OR timeout elapses."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if t.state == target:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_warming_to_failed_on_stderr_nvenc_pattern(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            # Wait for WARMING to settle
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            # Emit a fatal stderr line
+            fake.queue_stderr("[h264_nvenc @ 0x55] No NVENC capable devices found")
+            assert _wait_for_state(t, TranscoderState.FAILED, timeout=1.0), \
+                f"state={t.state}"
+            assert t.idle_reason == "hwaccel_unavailable"
+        finally:
+            t.stop()
+
+
+def test_warming_to_failed_on_stderr_input_pattern(tmp_path, sw_profile):
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            fake.queue_stderr("http://x/m.m3u8: HTTP error 404 Not Found")
+            assert _wait_for_state(t, TranscoderState.FAILED, timeout=1.0), \
+                f"state={t.state}"
+            assert t.idle_reason == "input_unreachable"
+        finally:
+            t.stop()

@@ -213,11 +213,30 @@ class Transcoder:
             time.sleep(self._poll_interval)
 
     def _stderr_reader_loop(self) -> None:
-        """Filled out in Task 7 (FAILED via stderr pattern)."""
+        """Drives state -> FAILED on any line matching _FATAL_PATTERNS.
+
+        Continues reading after the first fatal match so subsequent stderr
+        is still logged (useful for diagnostics). Exits when stderr closes.
+        """
+        assert self._process is not None
         try:
             for raw_line in self._process.stderr:  # type: ignore[union-attr]
                 line = raw_line.decode("utf-8", errors="replace").rstrip()
-                log.debug("ffmpeg stderr: %s", line)
+                if line:
+                    log.debug("ffmpeg stderr: %s", line)
+                reason = _classify_stderr_line(line)
+                if reason is not None:
+                    with self._state_lock:
+                        if self._state in (
+                            TranscoderState.SPAWNING,
+                            TranscoderState.WARMING,
+                            TranscoderState.READY,
+                            TranscoderState.STREAMING,
+                            TranscoderState.STALLED,
+                        ):
+                            self._set_state_locked(
+                                TranscoderState.FAILED, idle_reason=reason
+                            )
         except Exception:
             log.exception("stderr reader crashed")
 
