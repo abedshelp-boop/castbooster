@@ -820,3 +820,38 @@ def test_terminated_deletes_output_dir(tmp_path, sw_profile):
         assert t.state == TranscoderState.TERMINATED
         assert not slot_dir.exists(), \
             f"slot output_dir survived stop(): {list(slot_dir.iterdir()) if slot_dir.exists() else 'gone'}"
+
+
+# ---------- Task 3: filter_chain wiring --------------------------------------
+
+def test_default_filter_chain_renders_null_in_argv(tmp_path, sw_profile):
+    """Default Transcoder() with no filter_chain produces -vf null in argv."""
+    from castbooster.transcoder import Transcoder
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+    )
+    argv = t._build_argv()
+    vf_idx = argv.index("-vf")
+    assert argv[vf_idx + 1] == "null"
+
+
+def test_custom_filter_chain_renders_in_argv(tmp_path, sw_profile):
+    """A non-default filter_chain renders into -vf."""
+    from castbooster.transcoder import Transcoder
+    from castbooster.filter_chain import FilterChain
+
+    class _FakeScale:
+        def render(self) -> str:
+            return "scale=640:360"
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([_FakeScale()]),
+    )
+    argv = t._build_argv()
+    vf_idx = argv.index("-vf")
+    assert argv[vf_idx + 1] == "scale=640:360"

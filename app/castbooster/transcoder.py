@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from castbooster.ffmpeg_probe import AccelProfile
+from castbooster.filter_chain import FilterChain, NoopFilter
 
 log = logging.getLogger(__name__)
 
@@ -428,6 +429,7 @@ class Transcoder:
         accel: AccelProfile = None,                  # required; type-checked below
         *,
         base_output_dir: Optional[Path] = None,
+        filter_chain: Optional[FilterChain] = None,
         warming_timeout: float = 8.0,
         stall_timeout: float = 8.0,
         hls_segment_seconds: int = 2,
@@ -441,6 +443,7 @@ class Transcoder:
         self._input_url = input_url
         self._accel = accel
         self._base_output_dir = Path(base)
+        self._filter_chain: FilterChain = filter_chain or FilterChain([NoopFilter()])
         self._warming_timeout = warming_timeout
         self._stall_timeout = stall_timeout
         self._hls_segment_seconds = hls_segment_seconds
@@ -504,6 +507,7 @@ class Transcoder:
             output_dir=slot_dir,
             accel=self._accel,
             hls_segment_seconds=self._hls_segment_seconds,
+            vf_fragment=self._filter_chain.render(self._input_url),
         )
         self._current.start(argv)
         # _current's start() already moved sub_state to WARMING; mirror to aggregate
@@ -542,6 +546,7 @@ class Transcoder:
             output_dir=self._base_output_dir / "v1",
             accel=self._accel,
             hls_segment_seconds=self._hls_segment_seconds,
+            vf_fragment=self._filter_chain.render(self._input_url),
         )
 
     # ---- private internals ----
