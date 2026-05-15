@@ -307,7 +307,7 @@ class Transcoder:
                             self._set_state_locked(TranscoderState.STREAMING)
                             self._last_seg_count = seg_count
                             self._last_new_seg_monotonic = time.monotonic()
-                    continue
+                continue
 
             if current == TranscoderState.STREAMING:
                 _, seg_count = self._is_ready_on_disk()
