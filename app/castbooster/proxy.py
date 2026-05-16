@@ -8,7 +8,11 @@ import yarl
 from aiohttp import ClientSession, ClientTimeout, web
 
 from castbooster import __version__
+from castbooster import ffmpeg_probe
 from castbooster.caster import CastManager
+from castbooster.ffmpeg_probe import (
+    AccelProfile, FFmpegNotFoundError, FFmpegProbeError,
+)
 from castbooster.hls_rewriter import decode_url, rewrite_playlist
 from castbooster.netinfo import get_lan_ip
 from castbooster.session_store import SessionStore, StreamSession
@@ -578,6 +582,22 @@ async def _on_startup(app: web.Application) -> None:
     # WiFi-radio keepalive tasks from caster.py executor threads.
     cm.attach_loop(asyncio.get_running_loop())
     app["cast_manager"] = cm
+    # P2.4: cache AccelProfile so _handle_cast doesn't re-probe per cast.
+    # Probe failures are non-fatal — the passthrough path is still viable.
+    try:
+        app["accel_profile"] = ffmpeg_probe.detect()
+        log.info(
+            "ffmpeg probe ok: tier=%s encoder=%s decoder=%s path=%s",
+            app["accel_profile"].tier,
+            app["accel_profile"].encoder,
+            app["accel_profile"].decoder,
+            app["accel_profile"].ffmpeg_path,
+        )
+    except (FFmpegNotFoundError, FFmpegProbeError) as e:
+        log.warning(
+            "ffmpeg probe failed (%s); every cast will use passthrough", e,
+        )
+        app["accel_profile"] = None
 
 
 async def _on_cleanup(app: web.Application) -> None:
