@@ -173,6 +173,12 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
         "[cast token=%s] start uuid=%s upstream=%s",
         log_token, cast_uuid, sess.upstream_url[:120],
     )
+    # ALL blocking Transcoder/CastManager calls below MUST be offloaded via
+    # this executor — see spec §3.9.  Synchronously waiting on the transcoder
+    # would freeze the aiohttp event loop and prevent ffmpeg from fetching
+    # /upstream/master.m3u8 through the proxy, causing warming_timed_out on
+    # every cast.  (2026-05-16 root cause for the P2.4 acceptance regression.)
+    loop = asyncio.get_running_loop()
 
     # Step 2-3: passthrough decision
     env_passthrough = _is_passthrough_env_set()
@@ -206,17 +212,21 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
         sess.transcoder = transcoder
         sess.output_dir = base_output_dir
         try:
-            transcoder.start()
+            await loop.run_in_executor(None, transcoder.start)
             log.info("[cast token=%s] transcoder WARMING", log_token)
             t0 = time.monotonic()
-            ready = transcoder.wait_until_ready(timeout=warming_timeout)
+            log.info("[trace cast token=%s] pre-wait monotonic=%.3f", log_token, t0)  # 2026-05-16 diagnostic
+            ready = await loop.run_in_executor(
+                None, transcoder.wait_until_ready, warming_timeout
+            )
             elapsed = time.monotonic() - t0
+            log.info("[trace cast token=%s] post-wait monotonic=%.3f ready=%s elapsed=%.3f", log_token, time.monotonic(), ready, elapsed)  # 2026-05-16 diagnostic
         except Exception as e:
             log.exception("[cast token=%s] transcoder.start crashed", log_token)
             ready = False
             elapsed = 0.0
             try:
-                transcoder.stop()
+                await loop.run_in_executor(None, transcoder.stop)
             except Exception:
                 log.exception("[cast token=%s] transcoder.stop after crash failed", log_token)
             sess.transcoder = None
@@ -244,7 +254,7 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
                 log_token, stats["total"], stats["by_reason"],
             )
             try:
-                transcoder.stop()
+                await loop.run_in_executor(None, transcoder.stop)
             except Exception:
                 log.exception("[cast token=%s] transcoder.stop after FAILED failed", log_token)
             sess.transcoder = None
@@ -272,7 +282,6 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
                 log.exception("[cast token=%s] on_session_end transcoder.stop failed", log_token)
         sess.transcoder = None
 
-    loop = asyncio.get_running_loop()
     try:
         name = await loop.run_in_executor(
             None,
@@ -436,6 +445,7 @@ def _default_handlers() -> Dict[str, NMHandler]:
 
 
 async def _health(request: web.Request) -> web.Response:
+    log.info("[trace /health] hit monotonic=%.3f", time.monotonic())  # 2026-05-16 async-block diagnostic — removed in Phase D
     return web.json_response(
         {"ok": True, "version": __version__, "lanIp": request.app["lan_ip"]}
     )

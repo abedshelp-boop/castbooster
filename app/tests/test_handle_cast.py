@@ -2,6 +2,7 @@
 Transcoder + mocked CastManager — no real ffmpeg or pychromecast."""
 import asyncio
 import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -217,4 +218,71 @@ def test_cast_uses_per_tier_warming_timeout_sw(tmp_path):
         with patch("castbooster.proxy.Transcoder", _fake_ctor):
             await _handle_cast(app, {"token": sess.token, "castUuid": cast_uuid})
         assert constructed_kwargs[0]["warming_timeout"] == 12.0
+    _run(_go())
+
+
+class _BlockingFakeTranscoder(_FakeTranscoder):
+    """wait_until_ready blocks synchronously via time.sleep, mimicking the
+    real threading.Event.wait() that caused the 2026-05-16 async-block bug."""
+
+    WAIT_SECONDS = 0.5
+
+    def wait_until_ready(self, timeout=None):
+        self.wait_calls += 1
+        time.sleep(self.WAIT_SECONDS)
+        self._state = self._target
+        return self._ready_returns
+
+
+def test_cast_does_not_block_event_loop_during_warming(tmp_path):
+    """Regression for the 2026-05-16 async-block root cause (spec §3.9).
+
+    transcoder.wait_until_ready is synchronous (threading.Event.wait).  If
+    _handle_cast awaits it without an executor, the asyncio event loop is
+    frozen for the warming budget — ffmpeg's loopback fetches to
+    /upstream/* can't be accepted, so the transcoder never reaches READY
+    and every cast hits warming_timed_out.
+
+    Verification: run _handle_cast concurrently with an asyncio.sleep(0.05)
+    probe.  If the event loop is alive (fix in place), the probe fires
+    ~50 ms after gather start.  If the loop is blocked (bug regressed), it
+    fires only after the 500 ms synchronous wait completes.
+    """
+    async def _go():
+        app = _build_test_app(tmp_path)
+        sess = app["session_store"].create("https://example.com/p.m3u8")
+        cast_uuid = "12345678-1234-5678-1234-567812345690"
+        blocking_t = _BlockingFakeTranscoder(target_state=TranscoderState.READY)
+
+        gather_start = time.monotonic()
+        probe_fired_at = None
+
+        async def _loop_probe():
+            nonlocal probe_fired_at
+            await asyncio.sleep(0.05)
+            probe_fired_at = time.monotonic()
+
+        with patch("castbooster.proxy.Transcoder", lambda *a, **kw: blocking_t):
+            await asyncio.gather(
+                _handle_cast(app, {"token": sess.token, "castUuid": cast_uuid}),
+                _loop_probe(),
+            )
+
+        handler_elapsed = time.monotonic() - gather_start
+        assert blocking_t.wait_calls == 1
+        assert handler_elapsed >= _BlockingFakeTranscoder.WAIT_SECONDS - 0.05, (
+            f"handler returned in {handler_elapsed:.3f}s — wait_until_ready was not "
+            f"actually called for the full {_BlockingFakeTranscoder.WAIT_SECONDS}s"
+        )
+        probe_delay = probe_fired_at - gather_start
+        # If the loop was blocked, probe_delay ≈ WAIT_SECONDS (0.5).
+        # If the fix is in place, probe_delay ≈ 0.05.
+        # 0.2s threshold gives ample slack for Windows asyncio.sleep jitter
+        # (typically 15–30 ms granularity).
+        assert probe_delay < 0.2, (
+            f"event loop was blocked during transcoder.wait_until_ready: "
+            f"asyncio.sleep(0.05) probe fired after {probe_delay:.3f}s "
+            f"(expected <0.2s).  Did someone re-introduce a sync call to "
+            f"transcoder.wait_until_ready in _handle_cast?  See spec §3.9."
+        )
     _run(_go())
