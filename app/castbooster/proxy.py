@@ -55,6 +55,18 @@ _CORS_HEADERS = {
 
 _LOOPBACK_REMOTES = ("127.0.0.1", "::1")
 
+# P2.4: states in which /output/* may serve from disk. RELOADING is alive
+# — OLD slot is still streaming while NEW is warming. NEVER 503 RELOADING.
+# This applies the 2026-04-22 IDLE-race lesson to P2.3's new state.
+from castbooster.transcoder import TranscoderState
+
+_TRANSCODER_ALIVE_STATES = frozenset({
+    TranscoderState.READY,
+    TranscoderState.STREAMING,
+    TranscoderState.STALLED,
+    TranscoderState.RELOADING,
+})
+
 
 def _require_loopback(request: web.Request) -> Optional[web.Response]:
     """Return a 403 response if `request` is not from loopback, else None.
@@ -553,6 +565,78 @@ async def _handle_fetch(request: web.Request) -> web.StreamResponse:
     return await _proxy_fetch(request, sess, target_url)
 
 
+def _transcoder_alive(sess: StreamSession) -> bool:
+    """True iff the session's transcoder is in a state where /output/* can serve.
+    Defined in one place so the master + segment handlers can't drift."""
+    t = sess.transcoder
+    if t is None:
+        return False
+    return t.state in _TRANSCODER_ALIVE_STATES
+
+
+def _503_for_transcoder(sess: StreamSession) -> web.Response:
+    """Build the standard 503 body for /output/* when the transcoder isn't alive."""
+    t = sess.transcoder
+    body: Dict[str, Any] = {
+        "state": t.state.value if t is not None else "none",
+        "idle_reason": t.idle_reason if t is not None else None,
+    }
+    return web.json_response(body, status=503, headers=_CORS_HEADERS)
+
+
+async def _handle_output_manifest(request: web.Request) -> web.StreamResponse:
+    """Serve transcoder.output_dir / (master.m3u8 | variant.m3u8) from disk.
+
+    The output_dir property tracks the CURRENT slot — during RELOADING it's
+    still OLD; flips to NEW atomically on promotion. So we always serve the
+    file that's actually being written to.
+    """
+    token = request.match_info["token"]
+    sess = request.app["session_store"].get(token)
+    if sess is None:
+        return web.Response(status=404, text="unknown or expired token")
+    if not _transcoder_alive(sess):
+        return _503_for_transcoder(sess)
+    # Pick master.m3u8 vs variant.m3u8 from the path suffix.
+    filename = request.path.rsplit("/", 1)[-1]   # e.g. "master.m3u8"
+    if filename not in ("master.m3u8", "variant.m3u8"):
+        return web.Response(status=404, text="unknown output manifest")
+    path = sess.transcoder.output_dir / filename
+    if not path.is_file():
+        # Race: transcoder JUST flipped from RELOADING to STREAMING and the
+        # OLD slot's master.m3u8 was rmtree'd a millisecond ago. Treat as
+        # "not yet" — 503; client will retry.
+        return _503_for_transcoder(sess)
+    body = path.read_bytes()
+    headers = {
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Cache-Control": "no-store",
+        **_CORS_HEADERS,
+    }
+    return web.Response(body=body, status=200, headers=headers)
+
+
+async def _handle_output_segment(request: web.Request) -> web.StreamResponse:
+    """Serve transcoder.output_dir / seg_NNNNN.ts from disk."""
+    token = request.match_info["token"]
+    sess = request.app["session_store"].get(token)
+    if sess is None:
+        return web.Response(status=404, text="unknown or expired token")
+    if not _transcoder_alive(sess):
+        return _503_for_transcoder(sess)
+    n = request.match_info["n"]            # 5-digit numeric per route regex
+    path = sess.transcoder.output_dir / f"seg_{n}.ts"
+    if not path.is_file():
+        return web.Response(status=404, text="segment not found")
+    body = path.read_bytes()
+    headers = {
+        "Content-Type": "video/mp2t",
+        "Accept-Ranges": "bytes",
+        **_CORS_HEADERS,
+    }
+    return web.Response(body=body, status=200, headers=headers)
+
+
 async def _nm(request: web.Request) -> web.Response:
     try:
         msg = await request.json()
@@ -639,6 +723,14 @@ def _build_app(lan_ip: str) -> web.Application:
         app.router.add_route("OPTIONS", path, _handle_options)
     app.router.add_get("/s/{token}/upstream/fetch", _handle_fetch)
     app.router.add_route("OPTIONS", "/s/{token}/upstream/fetch", _handle_options)
+    # P2.4: /s/{token}/output/* — transcoder's local HLS, served from disk.
+    # These are LAN-accessible (Chromecast is the legitimate client).
+    app.router.add_get("/s/{token}/output/master.m3u8", _handle_output_manifest)
+    app.router.add_get("/s/{token}/output/variant.m3u8", _handle_output_manifest)
+    app.router.add_get(r"/s/{token}/output/seg_{n:\d{5}}.ts", _handle_output_segment)
+    app.router.add_route("OPTIONS", "/s/{token}/output/master.m3u8", _handle_options)
+    app.router.add_route("OPTIONS", "/s/{token}/output/variant.m3u8", _handle_options)
+    app.router.add_route("OPTIONS", r"/s/{token}/output/seg_{n:\d{5}}.ts", _handle_options)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
