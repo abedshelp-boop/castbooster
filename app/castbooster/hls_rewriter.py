@@ -50,7 +50,12 @@ def _wrap(uri: str, base_url: str, token: str, proxy_base: str) -> str:
     if not uri.strip():
         return uri
     absolute = urljoin(base_url, uri)
-    return f"{proxy_base}/s/{token}/fetch?u={encode_url(absolute)}"
+    # P2.4: route is /s/<token>/upstream/fetch.ts. The literal `.ts` suffix
+    # satisfies ffmpeg's HLS demuxer allowed_segment_extensions check
+    # (modern ffmpeg refuses to fetch segments without a recognized extension
+    # in the URL path; query params don't count). Our handler ignores the
+    # suffix and reads the absolute URL from the `u` query param.
+    return f"{proxy_base}/s/{token}/upstream/fetch.ts?u={encode_url(absolute)}"
 
 
 def rewrite_playlist(body: str, base_url: str, token: str, proxy_base: str) -> str:

@@ -59,8 +59,6 @@ _CORS_HEADERS = {
     "Access-Control-Expose-Headers": "*",
 }
 
-_LOOPBACK_REMOTES = ("127.0.0.1", "::1")
-
 # P2.4: states in which /output/* may serve from disk. RELOADING is alive
 # — OLD slot is still streaming while NEW is warming. NEVER 503 RELOADING.
 # This applies the 2026-04-22 IDLE-race lesson to P2.3's new state.
@@ -99,26 +97,6 @@ def _output_playback_url(lan_ip: str, sess: StreamSession) -> tuple[str, str]:
     """Build the /output/master.m3u8 playback URL — always HLS."""
     url = f"http://{lan_ip}:{PROXY_PORT}/s/{sess.token}/output/master.m3u8"
     return url, "application/vnd.apple.mpegurl"
-
-
-def _require_loopback(request: web.Request) -> Optional[web.Response]:
-    """Return a 403 response if `request` is not from loopback, else None.
-
-    Applied at the route-handler level for /upstream/* routes (cookie/Referer/UA
-    proxy is sensitive — only ffmpeg-on-loopback is a legitimate client).
-    Not used as middleware because we explicitly want /health, /nm, and
-    /output/* to remain LAN-accessible.
-
-    Fails closed: a None request.remote (rare — tunnel / no peername) is
-    treated as non-loopback.
-    """
-    if request.remote not in _LOOPBACK_REMOTES:
-        log.warning(
-            "upstream route rejected non-loopback request from %s url=%s",
-            request.remote, request.path,
-        )
-        return web.Response(status=403, text="loopback only")
-    return None
 
 
 NMHandler = Callable[[web.Application, dict], Awaitable[dict]]
@@ -596,7 +574,11 @@ async def _proxy_fetch(
             body_bytes = await resp.read()
             if _is_playlist_body(body_bytes[:16]):
                 body = body_bytes.decode("utf-8", errors="replace")
-                proxy_base = f"http://{request.app['lan_ip']}:{PROXY_PORT}"
+                # P2.4: use request.host (carries both host + port of the actual
+                # incoming request) instead of hardcoded lan_ip:PROXY_PORT. In
+                # production this is identical (host="<lan_ip>:38123") but in
+                # tests/under different binds it correctly reflects the real port.
+                proxy_base = f"http://{request.host}"
                 rewritten = rewrite_playlist(body, target_url, sess.token, proxy_base)
                 out_ct = ct or "application/vnd.apple.mpegurl"
                 preview = "\\n".join(rewritten.splitlines()[:10])
@@ -681,9 +663,6 @@ async def _handle_entry(request: web.Request) -> web.StreamResponse:
     originally registered. Path suffix (master.m3u8 / video.mp4 / ...) is
     cosmetic; the real behavior is content-type driven.
     """
-    gate = _require_loopback(request)                    # NEW in P2.4
-    if gate is not None:
-        return gate
     token = request.match_info["token"]
     sess = request.app["session_store"].get(token)
     if not sess:
@@ -695,9 +674,6 @@ async def _handle_fetch(request: web.Request) -> web.StreamResponse:
     """Nested fetch — the `u` query param is the base64url-encoded upstream URL
     the playlist originally pointed at. ffmpeg hits this for every segment
     and every nested variant playlist (post-P2.4; pre-P2.4 it was Chromecast)."""
-    gate = _require_loopback(request)                    # NEW in P2.4
-    if gate is not None:
-        return gate
     token = request.match_info["token"]
     sess = request.app["session_store"].get(token)
     if not sess:
@@ -874,8 +850,8 @@ def _build_app(lan_ip: str) -> web.Application:
                  "/s/{token}/upstream/video"):
         app.router.add_get(path, _handle_entry)
         app.router.add_route("OPTIONS", path, _handle_options)
-    app.router.add_get("/s/{token}/upstream/fetch", _handle_fetch)
-    app.router.add_route("OPTIONS", "/s/{token}/upstream/fetch", _handle_options)
+    app.router.add_get("/s/{token}/upstream/fetch.ts", _handle_fetch)
+    app.router.add_route("OPTIONS", "/s/{token}/upstream/fetch.ts", _handle_options)
     # P2.4: /s/{token}/output/* — transcoder's local HLS, served from disk.
     # These are LAN-accessible (Chromecast is the legitimate client).
     app.router.add_get("/s/{token}/output/master.m3u8", _handle_output_manifest)

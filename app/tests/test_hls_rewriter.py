@@ -17,7 +17,7 @@ TOKEN = "deadbeef"
 
 
 def _extract_u_param(rewritten_uri: str) -> str:
-    # rewritten_uri looks like http://192.168.1.42:38123/s/deadbeef/fetch?u=<base64>
+    # rewritten_uri looks like http://192.168.1.42:38123/s/deadbeef/upstream/fetch.ts?u=<base64>
     assert "?u=" in rewritten_uri, rewritten_uri
     return rewritten_uri.split("?u=", 1)[1]
 
@@ -41,7 +41,7 @@ def test_master_playlist_absolute_uris():
     lines = [l for l in out.splitlines() if l and not l.startswith("#")]
     assert len(lines) == 2
     for uri in lines:
-        assert uri.startswith(f"{PROXY_BASE}/s/{TOKEN}/fetch?u=")
+        assert uri.startswith(f"{PROXY_BASE}/s/{TOKEN}/upstream/fetch.ts?u=")
     # Round-trip: decoding the first one gives back the original absolute URL.
     decoded = decode_url(_extract_u_param(lines[0]))
     assert decoded == "https://cdn.example.com/v/720p/index.m3u8?token=aaa"
@@ -91,7 +91,7 @@ def test_playlist_with_ext_x_key_uri_attribute():
 
     # The #-lines with URI="..." attributes should have their attrs rewritten.
     key_line = next(l for l in out.splitlines() if l.startswith("#EXT-X-KEY"))
-    assert 'URI="' + PROXY_BASE + '/s/' + TOKEN + '/fetch?u=' in key_line
+    assert 'URI="' + PROXY_BASE + '/s/' + TOKEN + '/upstream/fetch.ts?u=' in key_line
     key_u = key_line.split('URI="', 1)[1].split('"', 1)[0]
     assert decode_url(_extract_u_param(key_u)) == "https://cdn.example.com/keys/abc.key"
 
@@ -108,7 +108,7 @@ def test_playlist_with_ext_x_key_uri_attribute():
     assert decode_url(_extract_u_param(media_u)) == "https://cdn.example.com/v/enc/audio/en.m3u8"
 
     # Segment line on its own.
-    seg_line = next(l for l in out.splitlines() if l.endswith("m4s") is False and "/fetch?u=" in l and not l.startswith("#"))
+    seg_line = next(l for l in out.splitlines() if l.endswith("m4s") is False and "/upstream/fetch.ts?u=" in l and not l.startswith("#"))
     seg_u = _extract_u_param(seg_line)
     assert decode_url(seg_u) == "https://cdn.example.com/v/enc/fragments/00001.m4s"
 
@@ -128,4 +128,4 @@ def test_blank_lines_preserved():
     out = rewrite_playlist(body, "https://x/y/", TOKEN, PROXY_BASE)
     # Two blank lines in, two blank lines out. Relative 'seg.ts' rewritten.
     assert out.count("\n\n") >= 1
-    assert "/fetch?u=" in out
+    assert "/upstream/fetch.ts?u=" in out
