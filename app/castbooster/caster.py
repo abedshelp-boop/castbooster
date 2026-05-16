@@ -619,6 +619,9 @@ class CastManager:
         this uuid (play-during-play race), fire the previous one outside the
         lock so its transcoder doesn't leak.
 
+        Passing callback=None pops any existing registration WITHOUT firing it
+        (used to clear without triggering teardown — e.g. tray-menu reset).
+
         The previous callback must be idempotent. Transcoder.stop() is idempotent
         by design (P2.2) so this contract is satisfied for our usage.
         """
@@ -628,9 +631,9 @@ class CastManager:
                 prev = self._session_end_callbacks.get(uuid)
                 self._session_end_callbacks[uuid] = callback
             else:
-                # Explicit None — clear any registration (rare; defensive).
-                prev = self._session_end_callbacks.pop(uuid, None)
-        if prev is not None and prev is not callback:
+                # Explicit None — clear any registration WITHOUT firing.
+                self._session_end_callbacks.pop(uuid, None)
+        if callback is not None and prev is not None and prev is not callback:
             try:
                 prev()
             except Exception:

@@ -118,3 +118,18 @@ def test_transcoder_failure_stats_returns_snapshot_not_alias():
     snapshot["total"] = 999
     second = cm.transcoder_failure_stats()
     assert second == {"total": 1, "by_reason": {"warming_timed_out": 1}}
+
+
+def test_register_with_none_pops_without_firing():
+    """Explicit None (clear path) must pop the existing callback WITHOUT firing
+    it. Used by callers that want to clear a registration without triggering
+    teardown (e.g. tray-menu reset).
+    """
+    uuid = UUID("12345678-1234-5678-1234-56781234567c")
+    cm = CastManager()
+    cb_a = MagicMock(name="cb_a")
+    with cm._lock:
+        cm._session_end_callbacks[uuid] = cb_a
+    cm._register_session_end_callback(uuid, None)
+    cb_a.assert_not_called()
+    assert uuid not in cm._session_end_callbacks
