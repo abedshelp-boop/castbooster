@@ -1,6 +1,10 @@
 import asyncio
 import logging
+import os
+import tempfile
 import threading
+import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import urlparse
 
@@ -13,9 +17,11 @@ from castbooster.caster import CastManager
 from castbooster.ffmpeg_probe import (
     AccelProfile, FFmpegNotFoundError, FFmpegProbeError,
 )
+from castbooster.filter_chain import FilterChain, NoopFilter
 from castbooster.hls_rewriter import decode_url, rewrite_playlist
 from castbooster.netinfo import get_lan_ip
 from castbooster.session_store import SessionStore, StreamSession
+from castbooster.transcoder import Transcoder, TranscoderState
 
 log = logging.getLogger(__name__)
 
@@ -58,14 +64,41 @@ _LOOPBACK_REMOTES = ("127.0.0.1", "::1")
 # P2.4: states in which /output/* may serve from disk. RELOADING is alive
 # — OLD slot is still streaming while NEW is warming. NEVER 503 RELOADING.
 # This applies the 2026-04-22 IDLE-race lesson to P2.3's new state.
-from castbooster.transcoder import TranscoderState
-
 _TRANSCODER_ALIVE_STATES = frozenset({
     TranscoderState.READY,
     TranscoderState.STREAMING,
     TranscoderState.STALLED,
     TranscoderState.RELOADING,
 })
+
+
+# P2.4: per-tier READY budget. Hardware encoders write first segment <= 4s;
+# software needs more headroom. See spec D2.
+_WARMING_TIMEOUT_BY_TIER = {
+    "nvidia": 6.0,
+    "intel":  6.0,
+    "amd":    6.0,
+    "sw":     12.0,
+}
+
+_PASSTHROUGH_ENV_TRUTHY = {"1", "true", "yes"}
+
+
+def _is_passthrough_env_set() -> bool:
+    return os.environ.get("CASTBOOSTER_PASSTHROUGH", "").strip().lower() in _PASSTHROUGH_ENV_TRUTHY
+
+
+def _passthrough_playback_url(lan_ip: str, sess: StreamSession) -> tuple[str, str]:
+    """Build the /upstream/{cosmetic-suffix} playback URL + content-type."""
+    path_seg, content_type = _guess_manifest_path(sess.upstream_url)
+    url = f"http://{lan_ip}:{PROXY_PORT}/s/{sess.token}/upstream/{path_seg}"
+    return url, content_type
+
+
+def _output_playback_url(lan_ip: str, sess: StreamSession) -> tuple[str, str]:
+    """Build the /output/master.m3u8 playback URL — always HLS."""
+    url = f"http://{lan_ip}:{PROXY_PORT}/s/{sess.token}/output/master.m3u8"
+    return url, "application/vnd.apple.mpegurl"
 
 
 def _require_loopback(request: web.Request) -> Optional[web.Response]:
@@ -141,6 +174,10 @@ async def _handle_list_casts(app: web.Application, _msg: dict) -> dict:
 
 
 async def _handle_cast(app: web.Application, msg: dict) -> dict:
+    """Spawn (or skip) a transcoder, READY-gate, fall back on FAILED.
+
+    See spec docs/superpowers/specs/2026-05-15-pillar-2.4-proxy-integration-design.md §3.2.
+    """
     token = msg.get("token")
     cast_uuid = msg.get("castUuid")
     if not token or not isinstance(token, str):
@@ -152,20 +189,130 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
     if sess is None:
         return {"type": "casting", "status": "error", "detail": "unknown token"}
 
-    path_seg, content_type = _guess_manifest_path(sess.upstream_url)
-    playback_url = f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/upstream/{path_seg}"
-
     cm: CastManager = app["cast_manager"]
+    log_token = token[:8]
+    log.info(
+        "[cast token=%s] start uuid=%s upstream=%s",
+        log_token, cast_uuid, sess.upstream_url[:120],
+    )
+
+    # Step 2-3: passthrough decision
+    env_passthrough = _is_passthrough_env_set()
+    if env_passthrough:
+        log.info("[cast token=%s] env CASTBOOSTER_PASSTHROUGH=1; passthrough forced", log_token)
+        sess.passthrough_only = True
+    accel = app.get("accel_profile")
+    if accel is None and not sess.passthrough_only:
+        log.warning("[cast token=%s] no AccelProfile available; forcing passthrough", log_token)
+        sess.passthrough_only = True
+
+    # Step 4: maybe spawn the transcoder
+    if not sess.passthrough_only:
+        warming_timeout = _WARMING_TIMEOUT_BY_TIER.get(accel.tier, 12.0)
+        base_output_dir = Path(tempfile.gettempdir()) / "castbooster" / token
+        upstream_loopback_url = (
+            f"http://127.0.0.1:{PROXY_PORT}/s/{token}/upstream/master.m3u8"
+        )
+        log.info(
+            "[cast token=%s] spawning transcoder accel=%s/%s/%s budget=%.1fs base=%s",
+            log_token, accel.encoder, accel.decoder, accel.tier,
+            warming_timeout, base_output_dir,
+        )
+        transcoder = Transcoder(
+            input_url=upstream_loopback_url,
+            base_output_dir=base_output_dir,
+            accel=accel,
+            filter_chain=FilterChain([NoopFilter()]),
+            warming_timeout=warming_timeout,
+        )
+        sess.transcoder = transcoder
+        sess.output_dir = base_output_dir
+        try:
+            transcoder.start()
+            log.info("[cast token=%s] transcoder WARMING", log_token)
+            t0 = time.monotonic()
+            ready = transcoder.wait_until_ready(timeout=warming_timeout)
+            elapsed = time.monotonic() - t0
+        except Exception as e:
+            log.exception("[cast token=%s] transcoder.start crashed", log_token)
+            ready = False
+            elapsed = 0.0
+            try:
+                transcoder.stop()
+            except Exception:
+                log.exception("[cast token=%s] transcoder.stop after crash failed", log_token)
+            sess.transcoder = None
+            sess.output_dir = None
+            sess.passthrough_only = True
+            cm.record_transcoder_failure(f"start_exception:{type(e).__name__}")
+        if ready:
+            log.info(
+                "[cast token=%s] transcoder READY in %.2fs (slot=v1)",
+                log_token, elapsed,
+            )
+        elif sess.passthrough_only:
+            # Already fell back above due to start-crash.
+            pass
+        else:
+            reason = transcoder.idle_reason or "warming_timed_out"
+            log.warning(
+                "[cast token=%s] transcoder FAILED reason=%s elapsed=%.2fs",
+                log_token, reason, elapsed,
+            )
+            cm.record_transcoder_failure(reason)
+            stats = cm.transcoder_failure_stats()
+            log.warning(
+                "[cast token=%s] failure counter: total=%d by_reason=%s",
+                log_token, stats["total"], stats["by_reason"],
+            )
+            try:
+                transcoder.stop()
+            except Exception:
+                log.exception("[cast token=%s] transcoder.stop after FAILED failed", log_token)
+            sess.transcoder = None
+            sess.output_dir = None
+            sess.passthrough_only = True
+            log.info(
+                "[cast token=%s] falling back to passthrough; session.passthrough_only=True",
+                log_token,
+            )
+
+    # Step 5-6: build playback URL + on_session_end + dispatch
+    if sess.passthrough_only:
+        playback_url, content_type = _passthrough_playback_url(app["lan_ip"], sess)
+    else:
+        playback_url, content_type = _output_playback_url(app["lan_ip"], sess)
+
+    def _on_session_end() -> None:
+        t = sess.transcoder
+        if t is not None and t.state not in (
+            TranscoderState.TERMINATING, TranscoderState.TERMINATED,
+        ):
+            try:
+                t.stop()
+            except Exception:
+                log.exception("[cast token=%s] on_session_end transcoder.stop failed", log_token)
+        sess.transcoder = None
+
     loop = asyncio.get_running_loop()
     try:
         name = await loop.run_in_executor(
-            None, cm.play, cast_uuid, playback_url, content_type
+            None,
+            lambda: cm.play(
+                cast_uuid, playback_url, content_type,
+                on_session_end=_on_session_end,
+                log_token=token,
+            ),
         )
     except LookupError as e:
         return {"type": "casting", "status": "error", "detail": str(e)}
     except Exception as e:
-        log.exception("cast play_media failed")
-        return {"type": "casting", "status": "error", "detail": f"play_media failed: {e}"}
+        log.exception("[cast token=%s] cm.play failed", log_token)
+        return {
+            "type": "casting", "status": "error",
+            "detail": f"play_media failed: {e}",
+        }
+    log.info("[cast token=%s] play_media → %s", log_token, playback_url)
     return {
         "type": "casting",
         "status": "ok",
@@ -687,6 +834,12 @@ async def _on_startup(app: web.Application) -> None:
             "ffmpeg probe failed (%s); every cast will use passthrough", e,
         )
         app["accel_profile"] = None
+
+    # P2.4: log if the dev escape hatch is engaged at startup.
+    if _is_passthrough_env_set():
+        log.warning(
+            "CASTBOOSTER_PASSTHROUGH=1 — transcoder bypassed; every cast is passthrough"
+        )
 
 
 async def _on_cleanup(app: web.Application) -> None:
