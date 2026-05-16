@@ -141,7 +141,7 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
         return {"type": "casting", "status": "error", "detail": "unknown token"}
 
     path_seg, content_type = _guess_manifest_path(sess.upstream_url)
-    playback_url = f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/{path_seg}"
+    playback_url = f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/upstream/{path_seg}"
 
     cm: CastManager = app["cast_manager"]
     loop = asyncio.get_running_loop()
@@ -197,7 +197,7 @@ async def _handle_register_stream(app: web.Application, msg: dict) -> dict:
     sess = store.create(url, cookies, headers, user_agent)
     path_seg, content_type = _guess_manifest_path(url)
     playback_url = (
-        f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/{path_seg}"
+        f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/upstream/{path_seg}"
     )
     return {
         "type": "stream_registered",
@@ -522,6 +522,9 @@ async def _handle_entry(request: web.Request) -> web.StreamResponse:
     originally registered. Path suffix (master.m3u8 / video.mp4 / ...) is
     cosmetic; the real behavior is content-type driven.
     """
+    gate = _require_loopback(request)                    # NEW in P2.4
+    if gate is not None:
+        return gate
     token = request.match_info["token"]
     sess = request.app["session_store"].get(token)
     if not sess:
@@ -531,9 +534,11 @@ async def _handle_entry(request: web.Request) -> web.StreamResponse:
 
 async def _handle_fetch(request: web.Request) -> web.StreamResponse:
     """Nested fetch — the `u` query param is the base64url-encoded upstream URL
-    the playlist originally pointed at. Chromecast hits this for every segment
-    and every nested variant playlist.
-    """
+    the playlist originally pointed at. ffmpeg hits this for every segment
+    and every nested variant playlist (post-P2.4; pre-P2.4 it was Chromecast)."""
+    gate = _require_loopback(request)                    # NEW in P2.4
+    if gate is not None:
+        return gate
     token = request.match_info["token"]
     sess = request.app["session_store"].get(token)
     if not sess:
@@ -621,14 +626,19 @@ def _build_app(lan_ip: str) -> web.Application:
     # uses it as a hint, we serve whatever the session's upstream really is.
     # (aiohttp's add_get already auto-handles HEAD, so we only register OPTIONS
     # explicitly for CORS preflight.)
-    for path in ("/s/{token}/master.m3u8", "/s/{token}/manifest.mpd",
-                 "/s/{token}/video.mp4", "/s/{token}/video.webm",
-                 "/s/{token}/video"):
+    # P2.4: /s/{token}/upstream/* — session-aware passthrough to the upstream
+    # streaming site. Loopback-only (ffmpeg is the legitimate client). The
+    # Chromecast does NOT reach here directly post-P2.4 — it reaches /output/*
+    # which is served by the transcoder.
+    for path in ("/s/{token}/upstream/master.m3u8",
+                 "/s/{token}/upstream/manifest.mpd",
+                 "/s/{token}/upstream/video.mp4",
+                 "/s/{token}/upstream/video.webm",
+                 "/s/{token}/upstream/video"):
         app.router.add_get(path, _handle_entry)
         app.router.add_route("OPTIONS", path, _handle_options)
-    # Nested fetch (segments, variant playlists, init segments, keys).
-    app.router.add_get("/s/{token}/fetch", _handle_fetch)
-    app.router.add_route("OPTIONS", "/s/{token}/fetch", _handle_options)
+    app.router.add_get("/s/{token}/upstream/fetch", _handle_fetch)
+    app.router.add_route("OPTIONS", "/s/{token}/upstream/fetch", _handle_options)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
