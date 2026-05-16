@@ -49,6 +49,28 @@ _CORS_HEADERS = {
     "Access-Control-Expose-Headers": "*",
 }
 
+_LOOPBACK_REMOTES = ("127.0.0.1", "::1")
+
+
+def _require_loopback(request: web.Request) -> Optional[web.Response]:
+    """Return a 403 response if `request` is not from loopback, else None.
+
+    Applied at the route-handler level for /upstream/* routes (cookie/Referer/UA
+    proxy is sensitive — only ffmpeg-on-loopback is a legitimate client).
+    Not used as middleware because we explicitly want /health, /nm, and
+    /output/* to remain LAN-accessible.
+
+    Fails closed: a None request.remote (rare — tunnel / no peername) is
+    treated as non-loopback.
+    """
+    if request.remote not in _LOOPBACK_REMOTES:
+        log.warning(
+            "upstream route rejected non-loopback request from %s url=%s",
+            request.remote, request.path,
+        )
+        return web.Response(status=403, text="loopback only")
+    return None
+
 
 NMHandler = Callable[[web.Application, dict], Awaitable[dict]]
 
