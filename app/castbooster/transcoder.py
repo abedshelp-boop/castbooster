@@ -182,6 +182,10 @@ class _ProcessSlot:
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NO_WINDOW
         log.info("slot spawning in %s", self._output_dir)
+        # 2026-05-17: log argv so diagnostic runs can reproduce the exact
+        # command line by hand. The /upstream/* loopback URL leaks the
+        # session token but the log is local-only.
+        log.info("ffmpeg argv: %s", " ".join(repr(a) for a in argv))
         self._process = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -189,6 +193,7 @@ class _ProcessSlot:
             stdout=subprocess.DEVNULL,
             creationflags=creationflags,
         )
+        log.info("ffmpeg subprocess PID=%s started", getattr(self._process, "pid", "?"))
         self._warming_started_monotonic = time.monotonic()
         with self._sub_state_lock:
             self._set_sub_state_locked(_SlotState.WARMING)

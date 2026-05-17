@@ -215,12 +215,10 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
             await loop.run_in_executor(None, transcoder.start)
             log.info("[cast token=%s] transcoder WARMING", log_token)
             t0 = time.monotonic()
-            log.info("[trace cast token=%s] pre-wait monotonic=%.3f", log_token, t0)  # 2026-05-16 diagnostic
             ready = await loop.run_in_executor(
                 None, transcoder.wait_until_ready, warming_timeout
             )
             elapsed = time.monotonic() - t0
-            log.info("[trace cast token=%s] post-wait monotonic=%.3f ready=%s elapsed=%.3f", log_token, time.monotonic(), ready, elapsed)  # 2026-05-16 diagnostic
         except Exception as e:
             log.exception("[cast token=%s] transcoder.start crashed", log_token)
             ready = False
@@ -445,7 +443,6 @@ def _default_handlers() -> Dict[str, NMHandler]:
 
 
 async def _health(request: web.Request) -> web.Response:
-    log.info("[trace /health] hit monotonic=%.3f", time.monotonic())  # 2026-05-16 async-block diagnostic — removed in Phase D
     return web.json_response(
         {"ok": True, "version": __version__, "lanIp": request.app["lan_ip"]}
     )
