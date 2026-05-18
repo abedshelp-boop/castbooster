@@ -184,7 +184,15 @@ def test_command_uses_libx264_flags_for_sw_tier(tmp_path, sw_profile):
     assert_adjacent("-vf", "null")
     assert_adjacent("-c:a", "copy")
     assert_adjacent("-hls_time", "2")
-    assert_adjacent("-hls_list_size", "6")
+    # 2026-05-18: list_size=0 (unlimited) + no delete_segments — see the
+    # comment in transcoder._build_argv. Prevents the Chromecast from
+    # 404'ing on segments ffmpeg has already produced + deleted.
+    assert_adjacent("-hls_list_size", "0")
+    flags_idx = argv.index("-hls_flags")
+    assert argv[flags_idx + 1] == "independent_segments", (
+        f"-hls_flags should be 'independent_segments' (no delete_segments / "
+        f"no append_list), got {argv[flags_idx + 1]!r}"
+    )
     assert_adjacent("-f", "hls")
     # Input URL passed through
     assert "http://x/m.m3u8" in argv

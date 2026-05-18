@@ -96,8 +96,14 @@ def _build_argv(
         "-c:a", "copy",
         "-f", "hls",
         "-hls_time", str(hls_segment_seconds),
-        "-hls_list_size", "6",
-        "-hls_flags", "delete_segments+append_list+independent_segments",
+        # 2026-05-18: 6-segment sliding window with delete_segments caused
+        # 404s on /output/seg_NNNNN.ts when SW transcoding ran at 22x
+        # realtime — ffmpeg deleted segments faster than the Chromecast
+        # could fetch them. Keep all segments listed + on disk for the
+        # duration of the session. output_dir is wiped on stop(), so disk
+        # use is bounded by the session length (~200KB per 2s segment).
+        "-hls_list_size", "0",
+        "-hls_flags", "independent_segments",
         "-hls_segment_filename", str(output_dir / "seg_%05d.ts"),
         str(output_dir / "variant.m3u8"),
     ]
