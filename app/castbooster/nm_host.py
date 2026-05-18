@@ -29,6 +29,13 @@ APP_PORT = 38123
 HEALTH_PATH = "/health"
 NM_PATH = "/nm"
 LAUNCH_WAIT_SECONDS = 5.0
+# 2026-05-17: the prior 0.8s timeout fired during transient asyncio-loop
+# freezes (notably pychromecast SSL reconnect, which stalls the proxy for a
+# few seconds on Python 3.14) and caused nm_host to spawn duplicate detached
+# processes — observed 62 times in a single session. Give the app enough
+# headroom to recover before declaring it dead.
+HEALTH_TIMEOUT_SECONDS = 2.5
+BUSY_RETRY_DELAY_SECONDS = 0.5
 
 log = logging.getLogger("castbooster.nm_host")
 
@@ -91,6 +98,31 @@ def _app_health_ok() -> bool:
         return False
 
 
+def _app_status() -> str:
+    """Probe /health on the running app.
+
+    Returns one of:
+      "ok"   — /health responded 200
+      "dead" — TCP connection refused (port not bound; app is genuinely gone)
+      "busy" — port is bound but the request timed out or returned non-200
+               (likely a transient asyncio-loop freeze, e.g. pychromecast SSL
+               reconnect on Python 3.14). Caller should retry once before
+               assuming the app is dead.
+    """
+    try:
+        conn = http.client.HTTPConnection(APP_HOST, APP_PORT, timeout=HEALTH_TIMEOUT_SECONDS)
+        try:
+            conn.request("GET", HEALTH_PATH)
+            resp = conn.getresponse()
+            return "ok" if resp.status == 200 else "busy"
+        finally:
+            conn.close()
+    except ConnectionRefusedError:
+        return "dead"
+    except Exception:
+        return "busy"
+
+
 def _launch_app_detached() -> None:
     """Spawn the main Cast Booster tray app as a detached background process.
 
@@ -119,8 +151,17 @@ def _launch_app_detached() -> None:
 
 
 def _ensure_app_running() -> bool:
-    if _app_health_ok():
+    status = _app_status()
+    if status == "ok":
         return True
+    if status == "busy":
+        # Port is bound but response was slow / non-200 — likely a transient
+        # asyncio-loop freeze. Wait briefly and retry once before spawning a
+        # duplicate. Duplicates cost us session-state loss + a 404 cascade on
+        # the Chromecast (the new process doesn't know the old session token).
+        time.sleep(BUSY_RETRY_DELAY_SECONDS)
+        if _app_status() == "ok":
+            return True
     _launch_app_detached()
     deadline = time.monotonic() + LAUNCH_WAIT_SECONDS
     while time.monotonic() < deadline:
