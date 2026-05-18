@@ -55,11 +55,19 @@ _TIER_FOR_ENCODER = {
     "libx264": "sw",
 }
 # Decoder priority per tier. "none" means SW decode (always available).
+#
+# 2026-05-17 amendment: sw tier now defaults to "none" (pure SW decode).
+# Hypothesis: when libx264 is the encoder, pairing with `-hwaccel d3d11va`
+# triggers an early D3D11 device-context initialization that hangs for the
+# full warming budget on some machines, producing no stderr output and
+# never reaching the input-URL fetch.  Forcing decoder="none" sidesteps the
+# hwaccel path entirely.  See plan
+# C:\Users\Abeds\.claude\plans\yo-continuing-p2-4-proxy-modular-sundae.md.
 _DECODER_FOR_TIER = {
     "nvidia": ("cuda", "d3d11va", "none"),
     "intel":  ("qsv",  "d3d11va", "none"),
     "amd":    ("d3d11va", "dxva2", "none"),
-    "sw":     ("d3d11va", "dxva2", "none"),
+    "sw":     ("none",),
 }
 
 

@@ -96,8 +96,14 @@ def _build_argv(
         "-c:a", "copy",
         "-f", "hls",
         "-hls_time", str(hls_segment_seconds),
-        "-hls_list_size", "6",
-        "-hls_flags", "delete_segments+append_list+independent_segments",
+        # 2026-05-18: 6-segment sliding window with delete_segments caused
+        # 404s on /output/seg_NNNNN.ts when SW transcoding ran at 22x
+        # realtime — ffmpeg deleted segments faster than the Chromecast
+        # could fetch them. Keep all segments listed + on disk for the
+        # duration of the session. output_dir is wiped on stop(), so disk
+        # use is bounded by the session length (~200KB per 2s segment).
+        "-hls_list_size", "0",
+        "-hls_flags", "independent_segments",
         "-hls_segment_filename", str(output_dir / "seg_%05d.ts"),
         str(output_dir / "variant.m3u8"),
     ]
@@ -182,6 +188,10 @@ class _ProcessSlot:
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NO_WINDOW
         log.info("slot spawning in %s", self._output_dir)
+        # 2026-05-17: log argv so diagnostic runs can reproduce the exact
+        # command line by hand. The /upstream/* loopback URL leaks the
+        # session token but the log is local-only.
+        log.info("ffmpeg argv: %s", " ".join(repr(a) for a in argv))
         self._process = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -189,6 +199,7 @@ class _ProcessSlot:
             stdout=subprocess.DEVNULL,
             creationflags=creationflags,
         )
+        log.info("ffmpeg subprocess PID=%s started", getattr(self._process, "pid", "?"))
         self._warming_started_monotonic = time.monotonic()
         with self._sub_state_lock:
             self._set_sub_state_locked(_SlotState.WARMING)
@@ -396,6 +407,11 @@ class _ProcessSlot:
                     log.debug("ffmpeg stderr: %s", line)
                 reason = _classify_stderr_line(line)
                 if reason is not None:
+                    # Surface the offending line at WARNING so the reason
+                    # behind a FAILED transition is visible without needing
+                    # CASTBOOSTER_LOG_LEVEL=DEBUG. Closes the 2026-05-17
+                    # 'input_unreachable with no captured stderr' gap.
+                    log.warning("ffmpeg fatal stderr (reason=%s): %s", reason, line)
                     with self._sub_state_lock:
                         if self._sub_state in (
                             _SlotState.SPAWNING, _SlotState.WARMING,

@@ -20,7 +20,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import UUID
 
 import pychromecast
@@ -50,9 +50,11 @@ class _MediaStatusLogger:
         self,
         friendly_name: str,
         on_idle: Optional[Callable[[], None]] = None,
+        log_token: Optional[str] = None,        # NEW in P2.4
     ) -> None:
         self.friendly_name = friendly_name
         self._on_idle = on_idle
+        self._log_token = log_token             # NEW
         # The first status update after play_media often carries
         # IDLE/INTERRUPTED — that's the *previous* session being kicked
         # off the device by our LOAD, NOT our new session terminating.
@@ -61,6 +63,8 @@ class _MediaStatusLogger:
         # least one non-IDLE state is observed before treating any
         # IDLE/terminal as a real session end.
         self._seen_active = False
+        self._first_playing_logged = False      # NEW
+        self._cast_start_monotonic = time.monotonic()  # NEW
 
     def new_media_status(self, status) -> None:
         try:
@@ -76,6 +80,17 @@ class _MediaStatusLogger:
             )
             if player_state in ("BUFFERING", "PLAYING", "PAUSED", "LOADING"):
                 self._seen_active = True
+            if (
+                player_state == "PLAYING"
+                and self._log_token is not None
+                and not self._first_playing_logged
+            ):
+                elapsed = time.monotonic() - self._cast_start_monotonic
+                log.info(
+                    "[cast token=%s] media_status first PLAYING after %.2fs",
+                    self._log_token[:8], elapsed,
+                )
+                self._first_playing_logged = True
             if (
                 self._seen_active
                 and self._on_idle is not None
@@ -117,6 +132,10 @@ class CastManager:
         # not per-connection (we don't re-acquire when the user swaps
         # streams on a device we're already casting to).
         self._wakelock_held: Set[UUID] = set()
+        # NEW in P2.4
+        self._session_end_callbacks: Dict[UUID, Callable[[], None]] = {}
+        self._transcoder_failure_counter: Dict[str, Any] = {"total": 0, "by_reason": {}}
+        # END NEW
         # Per-UUID asyncio task that emits a small TCP packet to the
         # Chromecast every ~1.2s while the session is active. Forces the
         # WiFi radio's tx chain to stay warm regardless of AP power-save
@@ -225,7 +244,15 @@ class CastManager:
                 )
             return out
 
-    def play(self, uuid_str: str, url: str, content_type: str) -> str:
+    def play(
+        self,
+        uuid_str: str,
+        url: str,
+        content_type: str,
+        *,
+        on_session_end: Optional[Callable[[], None]] = None,
+        log_token: Optional[str] = None,
+    ) -> str:
         """Block until the cast session is active. Returns the friendly name.
 
         Raises LookupError if the device isn't in the current discovery set,
@@ -236,6 +263,12 @@ class CastManager:
             uuid = UUID(uuid_str)
         except (ValueError, TypeError) as e:
             raise ValueError(f"invalid uuid: {uuid_str}") from e
+
+        # P2.4: stash the on_session_end callback BEFORE play_media. Handles
+        # the play-during-play race by firing any previously-registered
+        # callback (whose transcoder must be torn down).
+        if on_session_end is not None:
+            self._register_session_end_callback(uuid, on_session_end)
 
         with self._lock:
             info = self._casts.get(uuid)
@@ -265,6 +298,7 @@ class CastManager:
                     _MediaStatusLogger(
                         name,
                         on_idle=lambda u=uuid: self._release_wakelock_for(u),
+                        log_token=log_token,           # NEW in P2.4
                     )
                 )
                 setattr(conn, "_cb_status_logger_attached", True)
@@ -301,7 +335,8 @@ class CastManager:
         """Drop our wake-lock ref for a UUID if we hold one. Idempotent —
         safe to call from the stop button, the IDLE status listener, and
         `_on_remove` without double-releasing. Also tears down the per-UUID
-        WiFi keepalive task (also idempotent)."""
+        WiFi keepalive task (also idempotent). Finally, fires the
+        on_session_end callback registered by play() (P2.4)."""
         with self._lock:
             had = uuid in self._wakelock_held
             if had:
@@ -312,6 +347,14 @@ class CastManager:
         # task may exist if play() succeeded and we were in a stream-swap
         # bookkeeping window.
         self._stop_keepalive(uuid)
+        # P2.4: fire the on_session_end callback registered by play()
+        with self._lock:
+            cb = self._session_end_callbacks.pop(uuid, None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                log.exception("on_session_end callback failed (uuid=%s)", uuid)
 
     # ------------------------------------------------------------------
     # WiFi-radio keepalive
@@ -566,6 +609,54 @@ class CastManager:
             conn.set_volume(max(0.0, min(1.0, float(volume))))
         else:
             raise ValueError(f"unknown action: {action}")
+
+    def _register_session_end_callback(
+        self,
+        uuid: UUID,
+        callback: Optional[Callable[[], None]],
+    ) -> None:
+        """Stash an on_session_end callback. If one was already registered for
+        this uuid (play-during-play race), fire the previous one outside the
+        lock so its transcoder doesn't leak.
+
+        Passing callback=None pops any existing registration WITHOUT firing it
+        (used to clear without triggering teardown — e.g. tray-menu reset).
+
+        The previous callback must be idempotent. Transcoder.stop() is idempotent
+        by design (P2.2) so this contract is satisfied for our usage.
+        """
+        prev: Optional[Callable[[], None]] = None
+        with self._lock:
+            if callback is not None:
+                prev = self._session_end_callbacks.get(uuid)
+                self._session_end_callbacks[uuid] = callback
+            else:
+                # Explicit None — clear any registration WITHOUT firing.
+                self._session_end_callbacks.pop(uuid, None)
+        if callback is not None and prev is not None and prev is not callback:
+            try:
+                prev()
+            except Exception:
+                log.exception(
+                    "previous on_session_end callback failed during overwrite (uuid=%s)",
+                    uuid,
+                )
+
+    def record_transcoder_failure(self, reason: str) -> None:
+        """Increment the failure counter for `reason`. Safe to call from any thread."""
+        with self._lock:
+            self._transcoder_failure_counter["total"] += 1
+            br = self._transcoder_failure_counter["by_reason"]
+            br[reason] = br.get(reason, 0) + 1
+
+    def transcoder_failure_stats(self) -> Dict[str, Any]:
+        """Return a deep-copy snapshot of the failure counter. Tray menu (P2.7)
+        + tests both use this; callers must NOT mutate the returned dict."""
+        with self._lock:
+            return {
+                "total": self._transcoder_failure_counter["total"],
+                "by_reason": dict(self._transcoder_failure_counter["by_reason"]),
+            }
 
     def get_status(self, uuid_str: str) -> Dict[str, object]:
         conn = self._require_conn(uuid_str)

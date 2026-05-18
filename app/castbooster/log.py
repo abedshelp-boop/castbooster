@@ -16,9 +16,20 @@ LOG_PATH = _log_dir() / "castbooster.log"
 
 
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    """Initialize the root logger.
+
+    Honors env var CASTBOOSTER_LOG_LEVEL (DEBUG / INFO / WARNING / ERROR /
+    CRITICAL — case-insensitive) which overrides the default. Useful for
+    diagnostic runs where ffmpeg stderr (logged at DEBUG by Transcoder)
+    needs to be captured in the log file.
+    """
     root = logging.getLogger()
     if getattr(setup_logging, "_done", False):
         return root
+
+    env_level = os.environ.get("CASTBOOSTER_LOG_LEVEL", "").strip().upper()
+    if env_level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        level = getattr(logging, env_level)
 
     root.setLevel(level)
     fmt = logging.Formatter(

@@ -184,7 +184,15 @@ def test_command_uses_libx264_flags_for_sw_tier(tmp_path, sw_profile):
     assert_adjacent("-vf", "null")
     assert_adjacent("-c:a", "copy")
     assert_adjacent("-hls_time", "2")
-    assert_adjacent("-hls_list_size", "6")
+    # 2026-05-18: list_size=0 (unlimited) + no delete_segments — see the
+    # comment in transcoder._build_argv. Prevents the Chromecast from
+    # 404'ing on segments ffmpeg has already produced + deleted.
+    assert_adjacent("-hls_list_size", "0")
+    flags_idx = argv.index("-hls_flags")
+    assert argv[flags_idx + 1] == "independent_segments", (
+        f"-hls_flags should be 'independent_segments' (no delete_segments / "
+        f"no append_list), got {argv[flags_idx + 1]!r}"
+    )
     assert_adjacent("-f", "hls")
     # Input URL passed through
     assert "http://x/m.m3u8" in argv
@@ -422,6 +430,46 @@ def test_warming_to_failed_on_stderr_input_pattern(tmp_path, sw_profile):
             assert t.idle_reason == "input_unreachable"
         finally:
             fake.set_exit(0)   # release stderr reader so stop()'s join returns promptly
+            t.stop()
+
+
+def test_failure_triggering_stderr_line_is_logged_at_warning(tmp_path, sw_profile, caplog):
+    """When an ffmpeg stderr line matches a fatal pattern, the line itself
+    must be surfaced at WARNING so post-mortem log inspection can identify
+    the cause without requiring CASTBOOSTER_LOG_LEVEL=DEBUG. Regression
+    guard for the 2026-05-17 'input_unreachable with no captured stderr'
+    diagnostic gap."""
+    import logging
+    from castbooster.transcoder import Transcoder, TranscoderState
+    fake = FakeFfmpegProcess()
+    offending_line = "Invalid data found when processing input"
+    with patch("castbooster.transcoder.subprocess.Popen", return_value=fake):
+        t = Transcoder(
+            input_url="http://x/m.m3u8",
+            output_dir=tmp_path / "out",
+            accel=sw_profile,
+            _poll_interval=0.05,
+        )
+        t.start()
+        try:
+            assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+            with caplog.at_level(logging.WARNING, logger="castbooster.transcoder"):
+                fake.queue_stderr(offending_line)
+                assert _wait_for_state(t, TranscoderState.FAILED, timeout=1.0)
+            # Find the WARNING record carrying our offending line + the reason.
+            matches = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING
+                and offending_line in r.getMessage()
+                and "input_unreachable" in r.getMessage()
+            ]
+            assert matches, (
+                "expected a WARNING log record containing the offending "
+                "stderr line and the matched reason, got: "
+                + repr([(r.levelname, r.getMessage()) for r in caplog.records])
+            )
+        finally:
+            fake.set_exit(0)
             t.stop()
 
 

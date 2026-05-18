@@ -185,7 +185,7 @@ def test_detect_picks_libx264_when_only_sw_works(monkeypatch, tmp_path):
     assert profile.encoder == "libx264"
     assert profile.tier == "sw"
     assert profile.ffmpeg_path == str(fake)
-    assert profile.decoder == "d3d11va"   # fixtures list d3d11va, sw tier prefers it
+    assert profile.decoder == "none"   # sw tier now forces SW decode (2026-05-17 amendment)
     assert "h264_nvenc" in profile.available_encoders   # enumeration still recorded
     assert "cuda" in profile.available_hwaccels
 

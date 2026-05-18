@@ -1,6 +1,10 @@
 import asyncio
 import logging
+import os
+import tempfile
 import threading
+import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import urlparse
 
@@ -8,10 +12,16 @@ import yarl
 from aiohttp import ClientSession, ClientTimeout, web
 
 from castbooster import __version__
+from castbooster import ffmpeg_probe
 from castbooster.caster import CastManager
+from castbooster.ffmpeg_probe import (
+    AccelProfile, FFmpegNotFoundError, FFmpegProbeError,
+)
+from castbooster.filter_chain import FilterChain, NoopFilter
 from castbooster.hls_rewriter import decode_url, rewrite_playlist
 from castbooster.netinfo import get_lan_ip
 from castbooster.session_store import SessionStore, StreamSession
+from castbooster.transcoder import Transcoder, TranscoderState
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +58,45 @@ _CORS_HEADERS = {
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Expose-Headers": "*",
 }
+
+# P2.4: states in which /output/* may serve from disk. RELOADING is alive
+# — OLD slot is still streaming while NEW is warming. NEVER 503 RELOADING.
+# This applies the 2026-04-22 IDLE-race lesson to P2.3's new state.
+_TRANSCODER_ALIVE_STATES = frozenset({
+    TranscoderState.READY,
+    TranscoderState.STREAMING,
+    TranscoderState.STALLED,
+    TranscoderState.RELOADING,
+})
+
+
+# P2.4: per-tier READY budget. Hardware encoders write first segment <= 4s;
+# software needs more headroom. See spec D2.
+_WARMING_TIMEOUT_BY_TIER = {
+    "nvidia": 6.0,
+    "intel":  6.0,
+    "amd":    6.0,
+    "sw":     12.0,
+}
+
+_PASSTHROUGH_ENV_TRUTHY = {"1", "true", "yes"}
+
+
+def _is_passthrough_env_set() -> bool:
+    return os.environ.get("CASTBOOSTER_PASSTHROUGH", "").strip().lower() in _PASSTHROUGH_ENV_TRUTHY
+
+
+def _passthrough_playback_url(lan_ip: str, sess: StreamSession) -> tuple[str, str]:
+    """Build the /upstream/{cosmetic-suffix} playback URL + content-type."""
+    path_seg, content_type = _guess_manifest_path(sess.upstream_url)
+    url = f"http://{lan_ip}:{PROXY_PORT}/s/{sess.token}/upstream/{path_seg}"
+    return url, content_type
+
+
+def _output_playback_url(lan_ip: str, sess: StreamSession) -> tuple[str, str]:
+    """Build the /output/master.m3u8 playback URL — always HLS."""
+    url = f"http://{lan_ip}:{PROXY_PORT}/s/{sess.token}/output/master.m3u8"
+    return url, "application/vnd.apple.mpegurl"
 
 
 NMHandler = Callable[[web.Application, dict], Awaitable[dict]]
@@ -103,6 +152,10 @@ async def _handle_list_casts(app: web.Application, _msg: dict) -> dict:
 
 
 async def _handle_cast(app: web.Application, msg: dict) -> dict:
+    """Spawn (or skip) a transcoder, READY-gate, fall back on FAILED.
+
+    See spec docs/superpowers/specs/2026-05-15-pillar-2.4-proxy-integration-design.md §3.2.
+    """
     token = msg.get("token")
     cast_uuid = msg.get("castUuid")
     if not token or not isinstance(token, str):
@@ -114,20 +167,137 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
     if sess is None:
         return {"type": "casting", "status": "error", "detail": "unknown token"}
 
-    path_seg, content_type = _guess_manifest_path(sess.upstream_url)
-    playback_url = f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/{path_seg}"
-
     cm: CastManager = app["cast_manager"]
+    log_token = token[:8]
+    log.info(
+        "[cast token=%s] start uuid=%s upstream=%s",
+        log_token, cast_uuid, sess.upstream_url[:120],
+    )
+    # ALL blocking Transcoder/CastManager calls below MUST be offloaded via
+    # this executor — see spec §3.9.  Synchronously waiting on the transcoder
+    # would freeze the aiohttp event loop and prevent ffmpeg from fetching
+    # /upstream/master.m3u8 through the proxy, causing warming_timed_out on
+    # every cast.  (2026-05-16 root cause for the P2.4 acceptance regression.)
     loop = asyncio.get_running_loop()
+
+    # Step 2-3: passthrough decision
+    env_passthrough = _is_passthrough_env_set()
+    if env_passthrough:
+        log.info("[cast token=%s] env CASTBOOSTER_PASSTHROUGH=1; passthrough forced", log_token)
+        sess.passthrough_only = True
+    accel = app.get("accel_profile")
+    if accel is None and not sess.passthrough_only:
+        log.warning("[cast token=%s] no AccelProfile available; forcing passthrough", log_token)
+        sess.passthrough_only = True
+
+    # Step 4: maybe spawn the transcoder
+    if not sess.passthrough_only:
+        warming_timeout = _WARMING_TIMEOUT_BY_TIER.get(accel.tier, 12.0)
+        base_output_dir = Path(tempfile.gettempdir()) / "castbooster" / token
+        upstream_loopback_url = (
+            f"http://127.0.0.1:{PROXY_PORT}/s/{token}/upstream/master.m3u8"
+        )
+        log.info(
+            "[cast token=%s] spawning transcoder accel=%s/%s/%s budget=%.1fs base=%s",
+            log_token, accel.encoder, accel.decoder, accel.tier,
+            warming_timeout, base_output_dir,
+        )
+        transcoder = Transcoder(
+            input_url=upstream_loopback_url,
+            base_output_dir=base_output_dir,
+            accel=accel,
+            filter_chain=FilterChain([NoopFilter()]),
+            warming_timeout=warming_timeout,
+        )
+        sess.transcoder = transcoder
+        sess.output_dir = base_output_dir
+        try:
+            await loop.run_in_executor(None, transcoder.start)
+            log.info("[cast token=%s] transcoder WARMING", log_token)
+            t0 = time.monotonic()
+            ready = await loop.run_in_executor(
+                None, transcoder.wait_until_ready, warming_timeout
+            )
+            elapsed = time.monotonic() - t0
+        except Exception as e:
+            log.exception("[cast token=%s] transcoder.start crashed", log_token)
+            ready = False
+            elapsed = 0.0
+            try:
+                await loop.run_in_executor(None, transcoder.stop)
+            except Exception:
+                log.exception("[cast token=%s] transcoder.stop after crash failed", log_token)
+            sess.transcoder = None
+            sess.output_dir = None
+            sess.passthrough_only = True
+            cm.record_transcoder_failure(f"start_exception:{type(e).__name__}")
+        if ready:
+            log.info(
+                "[cast token=%s] transcoder READY in %.2fs (slot=v1)",
+                log_token, elapsed,
+            )
+        elif sess.passthrough_only:
+            # Already fell back above due to start-crash.
+            pass
+        else:
+            reason = transcoder.idle_reason or "warming_timed_out"
+            log.warning(
+                "[cast token=%s] transcoder FAILED reason=%s elapsed=%.2fs",
+                log_token, reason, elapsed,
+            )
+            cm.record_transcoder_failure(reason)
+            stats = cm.transcoder_failure_stats()
+            log.warning(
+                "[cast token=%s] failure counter: total=%d by_reason=%s",
+                log_token, stats["total"], stats["by_reason"],
+            )
+            try:
+                await loop.run_in_executor(None, transcoder.stop)
+            except Exception:
+                log.exception("[cast token=%s] transcoder.stop after FAILED failed", log_token)
+            sess.transcoder = None
+            sess.output_dir = None
+            sess.passthrough_only = True
+            log.info(
+                "[cast token=%s] falling back to passthrough; session.passthrough_only=True",
+                log_token,
+            )
+
+    # Step 5-6: build playback URL + on_session_end + dispatch
+    if sess.passthrough_only:
+        playback_url, content_type = _passthrough_playback_url(app["lan_ip"], sess)
+    else:
+        playback_url, content_type = _output_playback_url(app["lan_ip"], sess)
+
+    def _on_session_end() -> None:
+        t = sess.transcoder
+        if t is not None and t.state not in (
+            TranscoderState.TERMINATING, TranscoderState.TERMINATED,
+        ):
+            try:
+                t.stop()
+            except Exception:
+                log.exception("[cast token=%s] on_session_end transcoder.stop failed", log_token)
+        sess.transcoder = None
+
     try:
         name = await loop.run_in_executor(
-            None, cm.play, cast_uuid, playback_url, content_type
+            None,
+            lambda: cm.play(
+                cast_uuid, playback_url, content_type,
+                on_session_end=_on_session_end,
+                log_token=token,
+            ),
         )
     except LookupError as e:
         return {"type": "casting", "status": "error", "detail": str(e)}
     except Exception as e:
-        log.exception("cast play_media failed")
-        return {"type": "casting", "status": "error", "detail": f"play_media failed: {e}"}
+        log.exception("[cast token=%s] cm.play failed", log_token)
+        return {
+            "type": "casting", "status": "error",
+            "detail": f"play_media failed: {e}",
+        }
+    log.info("[cast token=%s] play_media → %s", log_token, playback_url)
     return {
         "type": "casting",
         "status": "ok",
@@ -171,7 +341,7 @@ async def _handle_register_stream(app: web.Application, msg: dict) -> dict:
     sess = store.create(url, cookies, headers, user_agent)
     path_seg, content_type = _guess_manifest_path(url)
     playback_url = (
-        f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/{path_seg}"
+        f"http://{app['lan_ip']}:{PROXY_PORT}/s/{sess.token}/upstream/{path_seg}"
     )
     return {
         "type": "stream_registered",
@@ -344,6 +514,44 @@ def _is_playlist_body(head: bytes) -> bool:
 _BAD_SEG_CT_PREFIXES = ("font/", "image/", "application/font-", "application/octet-stream")
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_HEADER_SCAN_LIMIT = 4096
+_TS_PACKET_SIZE = 188
+
+
+def detect_png_ts_wrapper_offset(head: bytes) -> int:
+    """Detect the anti-adblocker 'PNG-wrapped MPEG-TS' pattern.
+
+    Some pirate streaming CDNs (TikTok ad-CDN under masukestin/hanerix/audinifer
+    et al., observed 2026-05-18) prefix MPEG-TS segments with a ~62-byte fake
+    PNG header. The Chromecast tolerantly skips ahead to the TS sync byte and
+    plays the stream; ffmpeg's strict TS demuxer sees the PNG magic and bails
+    with 'Invalid data found when processing input'.
+
+    Returns the byte offset where the MPEG-TS stream begins inside `head`, or
+    0 if no wrapper is detected (caller serves bytes unchanged). The check is
+    deliberately strict: must be a valid PNG signature, must contain IEND, AND
+    the byte right after the IEND chunk's CRC must be the TS sync byte 0x47,
+    AND the next-expected TS sync byte (188 bytes later) must also be 0x47.
+    Three independent signals — vanishingly low false-positive rate.
+    """
+    if not head.startswith(_PNG_SIGNATURE):
+        return 0
+    iend = head.find(b"IEND", 0, _PNG_HEADER_SCAN_LIMIT)
+    if iend < 0:
+        return 0
+    # PNG IEND chunk: 4-byte type ('IEND') + 4-byte CRC. TS data follows.
+    ts_start = iend + 4 + 4
+    if ts_start >= len(head):
+        return 0
+    if head[ts_start] != 0x47:
+        return 0
+    second_sync = ts_start + _TS_PACKET_SIZE
+    if second_sync < len(head) and head[second_sync] != 0x47:
+        return 0
+    return ts_start
+
+
 def _infer_segment_content_type(target_url: str, upstream_ct: str) -> str:
     """Return the Content-Type to send the Chromecast for a media segment.
 
@@ -411,7 +619,11 @@ async def _proxy_fetch(
             body_bytes = await resp.read()
             if _is_playlist_body(body_bytes[:16]):
                 body = body_bytes.decode("utf-8", errors="replace")
-                proxy_base = f"http://{request.app['lan_ip']}:{PROXY_PORT}"
+                # P2.4: use request.host (carries both host + port of the actual
+                # incoming request) instead of hardcoded lan_ip:PROXY_PORT. In
+                # production this is identical (host="<lan_ip>:38123") but in
+                # tests/under different binds it correctly reflects the real port.
+                proxy_base = f"http://{request.host}"
                 rewritten = rewrite_playlist(body, target_url, sess.token, proxy_base)
                 out_ct = ct or "application/vnd.apple.mpegurl"
                 preview = "\\n".join(rewritten.splitlines()[:10])
@@ -456,18 +668,37 @@ async def _proxy_fetch(
                 headers[k] = v
             return web.Response(body=body_bytes, status=resp.status, headers=headers)
 
-        # Media bytes — stream through.
-        out = web.StreamResponse(status=resp.status)
+        # Media bytes — peek first 8KB to detect the PNG-wrapped MPEG-TS
+        # anti-adblocker pattern, then stream through (with the wrapper
+        # stripped if present).
+        peek = await resp.content.read(8192)
+        ts_offset = detect_png_ts_wrapper_offset(peek) if peek else 0
+        stripped = ts_offset > 0
+
+        out = web.StreamResponse(status=200 if stripped else resp.status)
         for name in _FORWARD_RESP_HEADERS:
             if name.lower() == "content-type":
+                continue
+            # When we strip a PNG wrapper the served byte-count + range
+            # semantics change; let aiohttp use chunked transfer instead of
+            # forwarding the now-wrong upstream length/range.
+            if stripped and name.lower() in ("content-length", "content-range"):
                 continue
             v = resp.headers.get(name)
             if v:
                 out.headers[name.title()] = v
-        out.headers["Content-Type"] = _infer_segment_content_type(target_url, ct)
+        if stripped:
+            out.headers["Content-Type"] = "video/mp2t"
+        else:
+            out.headers["Content-Type"] = _infer_segment_content_type(target_url, ct)
         out.headers.setdefault("Accept-Ranges", "bytes")
         for k, v in _CORS_HEADERS.items():
             out.headers[k] = v
+        if stripped:
+            log.info(
+                "proxy: stripped %d-byte PNG wrapper, serving as video/mp2t (url=%s)",
+                ts_offset, target_url[:120],
+            )
         log.info(
             "proxy: streaming %s status=%s upstream_ct=%s served_ct=%s",
             target_url[:120],
@@ -476,6 +707,9 @@ async def _proxy_fetch(
             out.headers["Content-Type"],
         )
         await out.prepare(request)
+        first_payload = peek[ts_offset:] if stripped else peek
+        if first_payload:
+            await out.write(first_payload)
         async for chunk in resp.content.iter_chunked(64 * 1024):
             await out.write(chunk)
         await out.write_eof()
@@ -505,9 +739,8 @@ async def _handle_entry(request: web.Request) -> web.StreamResponse:
 
 async def _handle_fetch(request: web.Request) -> web.StreamResponse:
     """Nested fetch — the `u` query param is the base64url-encoded upstream URL
-    the playlist originally pointed at. Chromecast hits this for every segment
-    and every nested variant playlist.
-    """
+    the playlist originally pointed at. ffmpeg hits this for every segment
+    and every nested variant playlist (post-P2.4; pre-P2.4 it was Chromecast)."""
     token = request.match_info["token"]
     sess = request.app["session_store"].get(token)
     if not sess:
@@ -520,6 +753,78 @@ async def _handle_fetch(request: web.Request) -> web.StreamResponse:
     except Exception:
         return web.Response(status=400, text="bad u")
     return await _proxy_fetch(request, sess, target_url)
+
+
+def _transcoder_alive(sess: StreamSession) -> bool:
+    """True iff the session's transcoder is in a state where /output/* can serve.
+    Defined in one place so the master + segment handlers can't drift."""
+    t = sess.transcoder
+    if t is None:
+        return False
+    return t.state in _TRANSCODER_ALIVE_STATES
+
+
+def _503_for_transcoder(sess: StreamSession) -> web.Response:
+    """Build the standard 503 body for /output/* when the transcoder isn't alive."""
+    t = sess.transcoder
+    body: Dict[str, Any] = {
+        "state": t.state.value if t is not None else "none",
+        "idle_reason": t.idle_reason if t is not None else None,
+    }
+    return web.json_response(body, status=503, headers=_CORS_HEADERS)
+
+
+async def _handle_output_manifest(request: web.Request) -> web.StreamResponse:
+    """Serve transcoder.output_dir / (master.m3u8 | variant.m3u8) from disk.
+
+    The output_dir property tracks the CURRENT slot — during RELOADING it's
+    still OLD; flips to NEW atomically on promotion. So we always serve the
+    file that's actually being written to.
+    """
+    token = request.match_info["token"]
+    sess = request.app["session_store"].get(token)
+    if sess is None:
+        return web.Response(status=404, text="unknown or expired token")
+    if not _transcoder_alive(sess):
+        return _503_for_transcoder(sess)
+    # Pick master.m3u8 vs variant.m3u8 from the path suffix.
+    filename = request.path.rsplit("/", 1)[-1]   # e.g. "master.m3u8"
+    if filename not in ("master.m3u8", "variant.m3u8"):
+        return web.Response(status=404, text="unknown output manifest")
+    path = sess.transcoder.output_dir / filename
+    if not path.is_file():
+        # Race: transcoder JUST flipped from RELOADING to STREAMING and the
+        # OLD slot's master.m3u8 was rmtree'd a millisecond ago. Treat as
+        # "not yet" — 503; client will retry.
+        return _503_for_transcoder(sess)
+    body = path.read_bytes()
+    headers = {
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Cache-Control": "no-store",
+        **_CORS_HEADERS,
+    }
+    return web.Response(body=body, status=200, headers=headers)
+
+
+async def _handle_output_segment(request: web.Request) -> web.StreamResponse:
+    """Serve transcoder.output_dir / seg_NNNNN.ts from disk."""
+    token = request.match_info["token"]
+    sess = request.app["session_store"].get(token)
+    if sess is None:
+        return web.Response(status=404, text="unknown or expired token")
+    if not _transcoder_alive(sess):
+        return _503_for_transcoder(sess)
+    n = request.match_info["n"]            # 5-digit numeric per route regex
+    path = sess.transcoder.output_dir / f"seg_{n}.ts"
+    if not path.is_file():
+        return web.Response(status=404, text="segment not found")
+    body = path.read_bytes()
+    headers = {
+        "Content-Type": "video/mp2t",
+        "Accept-Ranges": "bytes",
+        **_CORS_HEADERS,
+    }
+    return web.Response(body=body, status=200, headers=headers)
 
 
 async def _nm(request: web.Request) -> web.Response:
@@ -556,6 +861,28 @@ async def _on_startup(app: web.Application) -> None:
     # WiFi-radio keepalive tasks from caster.py executor threads.
     cm.attach_loop(asyncio.get_running_loop())
     app["cast_manager"] = cm
+    # P2.4: cache AccelProfile so _handle_cast doesn't re-probe per cast.
+    # Probe failures are non-fatal — the passthrough path is still viable.
+    try:
+        app["accel_profile"] = ffmpeg_probe.detect()
+        log.info(
+            "ffmpeg probe ok: tier=%s encoder=%s decoder=%s path=%s",
+            app["accel_profile"].tier,
+            app["accel_profile"].encoder,
+            app["accel_profile"].decoder,
+            app["accel_profile"].ffmpeg_path,
+        )
+    except (FFmpegNotFoundError, FFmpegProbeError) as e:
+        log.warning(
+            "ffmpeg probe failed (%s); every cast will use passthrough", e,
+        )
+        app["accel_profile"] = None
+
+    # P2.4: log if the dev escape hatch is engaged at startup.
+    if _is_passthrough_env_set():
+        log.warning(
+            "CASTBOOSTER_PASSTHROUGH=1 — transcoder bypassed; every cast is passthrough"
+        )
 
 
 async def _on_cleanup(app: web.Application) -> None:
@@ -579,14 +906,27 @@ def _build_app(lan_ip: str) -> web.Application:
     # uses it as a hint, we serve whatever the session's upstream really is.
     # (aiohttp's add_get already auto-handles HEAD, so we only register OPTIONS
     # explicitly for CORS preflight.)
-    for path in ("/s/{token}/master.m3u8", "/s/{token}/manifest.mpd",
-                 "/s/{token}/video.mp4", "/s/{token}/video.webm",
-                 "/s/{token}/video"):
+    # P2.4: /s/{token}/upstream/* — session-aware passthrough to the upstream
+    # streaming site. Loopback-only (ffmpeg is the legitimate client). The
+    # Chromecast does NOT reach here directly post-P2.4 — it reaches /output/*
+    # which is served by the transcoder.
+    for path in ("/s/{token}/upstream/master.m3u8",
+                 "/s/{token}/upstream/manifest.mpd",
+                 "/s/{token}/upstream/video.mp4",
+                 "/s/{token}/upstream/video.webm",
+                 "/s/{token}/upstream/video"):
         app.router.add_get(path, _handle_entry)
         app.router.add_route("OPTIONS", path, _handle_options)
-    # Nested fetch (segments, variant playlists, init segments, keys).
-    app.router.add_get("/s/{token}/fetch", _handle_fetch)
-    app.router.add_route("OPTIONS", "/s/{token}/fetch", _handle_options)
+    app.router.add_get("/s/{token}/upstream/fetch.ts", _handle_fetch)
+    app.router.add_route("OPTIONS", "/s/{token}/upstream/fetch.ts", _handle_options)
+    # P2.4: /s/{token}/output/* — transcoder's local HLS, served from disk.
+    # These are LAN-accessible (Chromecast is the legitimate client).
+    app.router.add_get("/s/{token}/output/master.m3u8", _handle_output_manifest)
+    app.router.add_get("/s/{token}/output/variant.m3u8", _handle_output_manifest)
+    app.router.add_get(r"/s/{token}/output/seg_{n:\d{5}}.ts", _handle_output_segment)
+    app.router.add_route("OPTIONS", "/s/{token}/output/master.m3u8", _handle_options)
+    app.router.add_route("OPTIONS", "/s/{token}/output/variant.m3u8", _handle_options)
+    app.router.add_route("OPTIONS", r"/s/{token}/output/seg_{n:\d{5}}.ts", _handle_options)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
