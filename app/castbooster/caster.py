@@ -28,6 +28,7 @@ import zeroconf
 from pychromecast.discovery import CastBrowser, SimpleCastListener
 
 from castbooster import wakelock
+from castbooster.receiver_caps import ReceiverCaps, capabilities_for_model
 
 log = logging.getLogger(__name__)
 
@@ -609,6 +610,24 @@ class CastManager:
             conn.set_volume(max(0.0, min(1.0, float(volume))))
         else:
             raise ValueError(f"unknown action: {action}")
+
+    def capabilities(self, uuid_str: str) -> ReceiverCaps:
+        """Look up the receiver's capabilities by uuid.
+
+        Returns conservative `unknown` defaults if the uuid hasn't been
+        discovered yet (e.g., caller raced discovery, or device dropped).
+        Callers can safely act on the result without a None check.
+        """
+        try:
+            uuid_obj = UUID(uuid_str)
+        except (ValueError, AttributeError):
+            return capabilities_for_model("")
+        with self._lock:
+            info = self._casts.get(uuid_obj)
+        if info is None:
+            return capabilities_for_model("")
+        model_name = getattr(info, "model_name", "") or ""
+        return capabilities_for_model(model_name)
 
     def _register_session_end_callback(
         self,
