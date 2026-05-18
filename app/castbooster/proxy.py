@@ -514,6 +514,44 @@ def _is_playlist_body(head: bytes) -> bool:
 _BAD_SEG_CT_PREFIXES = ("font/", "image/", "application/font-", "application/octet-stream")
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_HEADER_SCAN_LIMIT = 4096
+_TS_PACKET_SIZE = 188
+
+
+def detect_png_ts_wrapper_offset(head: bytes) -> int:
+    """Detect the anti-adblocker 'PNG-wrapped MPEG-TS' pattern.
+
+    Some pirate streaming CDNs (TikTok ad-CDN under masukestin/hanerix/audinifer
+    et al., observed 2026-05-18) prefix MPEG-TS segments with a ~62-byte fake
+    PNG header. The Chromecast tolerantly skips ahead to the TS sync byte and
+    plays the stream; ffmpeg's strict TS demuxer sees the PNG magic and bails
+    with 'Invalid data found when processing input'.
+
+    Returns the byte offset where the MPEG-TS stream begins inside `head`, or
+    0 if no wrapper is detected (caller serves bytes unchanged). The check is
+    deliberately strict: must be a valid PNG signature, must contain IEND, AND
+    the byte right after the IEND chunk's CRC must be the TS sync byte 0x47,
+    AND the next-expected TS sync byte (188 bytes later) must also be 0x47.
+    Three independent signals — vanishingly low false-positive rate.
+    """
+    if not head.startswith(_PNG_SIGNATURE):
+        return 0
+    iend = head.find(b"IEND", 0, _PNG_HEADER_SCAN_LIMIT)
+    if iend < 0:
+        return 0
+    # PNG IEND chunk: 4-byte type ('IEND') + 4-byte CRC. TS data follows.
+    ts_start = iend + 4 + 4
+    if ts_start >= len(head):
+        return 0
+    if head[ts_start] != 0x47:
+        return 0
+    second_sync = ts_start + _TS_PACKET_SIZE
+    if second_sync < len(head) and head[second_sync] != 0x47:
+        return 0
+    return ts_start
+
+
 def _infer_segment_content_type(target_url: str, upstream_ct: str) -> str:
     """Return the Content-Type to send the Chromecast for a media segment.
 
@@ -630,18 +668,37 @@ async def _proxy_fetch(
                 headers[k] = v
             return web.Response(body=body_bytes, status=resp.status, headers=headers)
 
-        # Media bytes — stream through.
-        out = web.StreamResponse(status=resp.status)
+        # Media bytes — peek first 8KB to detect the PNG-wrapped MPEG-TS
+        # anti-adblocker pattern, then stream through (with the wrapper
+        # stripped if present).
+        peek = await resp.content.read(8192)
+        ts_offset = detect_png_ts_wrapper_offset(peek) if peek else 0
+        stripped = ts_offset > 0
+
+        out = web.StreamResponse(status=200 if stripped else resp.status)
         for name in _FORWARD_RESP_HEADERS:
             if name.lower() == "content-type":
+                continue
+            # When we strip a PNG wrapper the served byte-count + range
+            # semantics change; let aiohttp use chunked transfer instead of
+            # forwarding the now-wrong upstream length/range.
+            if stripped and name.lower() in ("content-length", "content-range"):
                 continue
             v = resp.headers.get(name)
             if v:
                 out.headers[name.title()] = v
-        out.headers["Content-Type"] = _infer_segment_content_type(target_url, ct)
+        if stripped:
+            out.headers["Content-Type"] = "video/mp2t"
+        else:
+            out.headers["Content-Type"] = _infer_segment_content_type(target_url, ct)
         out.headers.setdefault("Accept-Ranges", "bytes")
         for k, v in _CORS_HEADERS.items():
             out.headers[k] = v
+        if stripped:
+            log.info(
+                "proxy: stripped %d-byte PNG wrapper, serving as video/mp2t (url=%s)",
+                ts_offset, target_url[:120],
+            )
         log.info(
             "proxy: streaming %s status=%s upstream_ct=%s served_ct=%s",
             target_url[:120],
@@ -650,25 +707,10 @@ async def _proxy_fetch(
             out.headers["Content-Type"],
         )
         await out.prepare(request)
-        # 2026-05-18 diagnostic: when upstream content-type is image/* or
-        # octet-stream (common on anti-adblocker disguised video URLs), log
-        # the first chunk's magic bytes so we can tell whether bytes are
-        # real video (47 = TS sync), real PNG (89 50 4E 47), or something
-        # else. One-shot per request — remove once the hanerix.com / similar
-        # decode failure is understood.
-        _log_first_bytes = (resp.headers.get("Content-Type") or "").lower().startswith(
-            ("image/", "application/octet-stream")
-        )
+        first_payload = peek[ts_offset:] if stripped else peek
+        if first_payload:
+            await out.write(first_payload)
         async for chunk in resp.content.iter_chunked(64 * 1024):
-            if _log_first_bytes:
-                _log_first_bytes = False
-                head = bytes(chunk[:16])
-                log.info(
-                    "proxy: first-bytes-of-disguised-segment magic=%s ascii=%r url=%s",
-                    head.hex(" ").upper(),
-                    head.decode("ascii", errors="replace"),
-                    target_url[:120],
-                )
             await out.write(chunk)
         await out.write_eof()
         return out
