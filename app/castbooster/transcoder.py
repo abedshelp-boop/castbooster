@@ -96,6 +96,11 @@ def _build_argv(
         "-c:a", "copy",
         "-f", "hls",
         "-hls_time", str(hls_segment_seconds),
+        # 2026-05-18: PLAYLIST-TYPE:VOD enables Chromecast drag-seek on the
+        # output playlist. Without it the player treats the live-style
+        # playlist as un-seekable and disables the scrubber UI. EXT-X-ENDLIST
+        # gets written on clean ffmpeg exit (session stop or upstream EOF).
+        "-hls_playlist_type", "vod",
         # 2026-05-18: 6-segment sliding window with delete_segments caused
         # 404s on /output/seg_NNNNN.ts when SW transcoding ran at 22x
         # realtime — ffmpeg deleted segments faster than the Chromecast

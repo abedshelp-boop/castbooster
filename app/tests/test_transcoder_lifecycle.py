@@ -184,6 +184,9 @@ def test_command_uses_libx264_flags_for_sw_tier(tmp_path, sw_profile):
     assert_adjacent("-vf", "null")
     assert_adjacent("-c:a", "copy")
     assert_adjacent("-hls_time", "2")
+    # 2026-05-18: PLAYLIST-TYPE:VOD enables drag-seek on the Chromecast
+    # scrubber. Without it the live-style playlist disables absolute seek.
+    assert_adjacent("-hls_playlist_type", "vod")
     # 2026-05-18: list_size=0 (unlimited) + no delete_segments — see the
     # comment in transcoder._build_argv. Prevents the Chromecast from
     # 404'ing on segments ffmpeg has already produced + deleted.
