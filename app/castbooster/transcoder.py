@@ -401,6 +401,11 @@ class _ProcessSlot:
                     log.debug("ffmpeg stderr: %s", line)
                 reason = _classify_stderr_line(line)
                 if reason is not None:
+                    # Surface the offending line at WARNING so the reason
+                    # behind a FAILED transition is visible without needing
+                    # CASTBOOSTER_LOG_LEVEL=DEBUG. Closes the 2026-05-17
+                    # 'input_unreachable with no captured stderr' gap.
+                    log.warning("ffmpeg fatal stderr (reason=%s): %s", reason, line)
                     with self._sub_state_lock:
                         if self._sub_state in (
                             _SlotState.SPAWNING, _SlotState.WARMING,
