@@ -650,7 +650,25 @@ async def _proxy_fetch(
             out.headers["Content-Type"],
         )
         await out.prepare(request)
+        # 2026-05-18 diagnostic: when upstream content-type is image/* or
+        # octet-stream (common on anti-adblocker disguised video URLs), log
+        # the first chunk's magic bytes so we can tell whether bytes are
+        # real video (47 = TS sync), real PNG (89 50 4E 47), or something
+        # else. One-shot per request — remove once the hanerix.com / similar
+        # decode failure is understood.
+        _log_first_bytes = (resp.headers.get("Content-Type") or "").lower().startswith(
+            ("image/", "application/octet-stream")
+        )
         async for chunk in resp.content.iter_chunked(64 * 1024):
+            if _log_first_bytes:
+                _log_first_bytes = False
+                head = bytes(chunk[:16])
+                log.info(
+                    "proxy: first-bytes-of-disguised-segment magic=%s ascii=%r url=%s",
+                    head.hex(" ").upper(),
+                    head.decode("ascii", errors="replace"),
+                    target_url[:120],
+                )
             await out.write(chunk)
         await out.write_eof()
         return out
