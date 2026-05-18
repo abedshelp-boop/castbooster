@@ -182,7 +182,11 @@ def test_command_uses_libx264_flags_for_sw_tier(tmp_path, sw_profile):
     assert_adjacent("-tune", "zerolatency")
     assert_adjacent("-pix_fmt", "yuv420p")
     assert_adjacent("-vf", "null")
-    assert_adjacent("-c:a", "copy")
+    # 2026-05-19 P2.5: always re-encode audio to AAC. Fixes AC3/EAC3
+    # silent-playback on Chromecast 3rd gen. Generation loss on
+    # AAC->AAC is imperceptible at 192k.
+    assert_adjacent("-c:a", "aac")
+    assert_adjacent("-b:a", "192k")
     assert_adjacent("-hls_time", "2")
     # 2026-05-18: PLAYLIST-TYPE:VOD enables drag-seek on the Chromecast
     # scrubber. Without it the live-style playlist disables absolute seek.

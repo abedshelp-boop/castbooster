@@ -93,7 +93,12 @@ def _build_argv(
         f"expr:gte(t,n_forced*{hls_segment_seconds})",
     ]
     argv += [
-        "-c:a", "copy",
+        # 2026-05-19 P2.5: always re-encode audio to AAC. Fixes AC3/EAC3
+        # silent-playback on Chromecast 3rd gen (which only supports AAC
+        # / MP3). Generation loss on AAC->AAC is imperceptible at 192k;
+        # CPU cost is ~1-2% on SW transcoding budgets.
+        "-c:a", "aac",
+        "-b:a", "192k",
         "-f", "hls",
         "-hls_time", str(hls_segment_seconds),
         # 2026-05-18: PLAYLIST-TYPE:VOD enables Chromecast drag-seek on the
