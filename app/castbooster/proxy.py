@@ -20,6 +20,7 @@ from castbooster.ffmpeg_probe import (
 from castbooster.filter_chain import FilterChain, NoopFilter
 from castbooster.hls_rewriter import decode_url, rewrite_playlist
 from castbooster.netinfo import get_lan_ip
+from castbooster.output_dir_sweep import sweep_stranded_output_dirs
 from castbooster.session_store import SessionStore, StreamSession
 from castbooster.transcoder import Transcoder, TranscoderState
 
@@ -853,6 +854,14 @@ async def _nm(request: web.Request) -> web.Response:
 
 
 async def _on_startup(app: web.Application) -> None:
+    # P2.6: wipe leftover per-session output dirs from prior crashed/killed
+    # runs. main._another_instance_healthy already gated duplicates, so we
+    # own this machine's castbooster state by the time we reach here.
+    sweep_result = sweep_stranded_output_dirs()
+    log.info(
+        "startup sweep: swept=%d errors=%d",
+        sweep_result["swept"], sweep_result["errors"],
+    )
     # ClientSession must be created inside the loop that will use it.
     app["http_client"] = ClientSession()
     cm = CastManager()
