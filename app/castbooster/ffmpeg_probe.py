@@ -428,6 +428,7 @@ def probe_input_video(
         return None
     streams = data.get("streams") or []
     if not streams:
+        log.warning("ffprobe found no video stream on %s", url)
         return None
     s = streams[0]
     try:
@@ -435,6 +436,7 @@ def probe_input_video(
         height = int(s["height"])
         pix_fmt = str(s["pix_fmt"])
     except (KeyError, ValueError, TypeError):
+        log.warning("ffprobe stream missing required fields on %s: %s", url, list(s.keys()))
         return None
     r = s.get("r_frame_rate") or ""
     a = s.get("avg_frame_rate") or ""

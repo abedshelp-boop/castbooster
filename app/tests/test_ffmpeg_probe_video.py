@@ -116,7 +116,7 @@ def test_input_video_info_holds_all_fields():
 
 # ---------- probe_input_video happy path (V1) -------------------------------
 
-def test_probe_returns_info_for_cfr_input(tmp_path, monkeypatch):
+def test_probe_returns_info_for_cfr_input(monkeypatch):
     """CFR input (r == a) → returns InputVideoInfo with parsed fps."""
     # Stub _locate_ffprobe to return a known path so we don't depend on the
     # filesystem layout. Stub _run to return the CFR fixture JSON.
@@ -126,7 +126,7 @@ def test_probe_returns_info_for_cfr_input(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         ffmpeg_probe, "_run",
-        lambda args, timeout: _completed(0, stdout=_load("ffprobe_cfr_1080p.json")),
+        lambda args, *, timeout: _completed(0, stdout=_load("ffprobe_cfr_1080p.json")),
     )
     info = ffmpeg_probe.probe_input_video(
         "http://example.com/x.m3u8",
