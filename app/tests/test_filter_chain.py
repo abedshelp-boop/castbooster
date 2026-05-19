@@ -38,6 +38,9 @@ def test_custom_filterstage_protocol_works():
         def render(self) -> str:
             return "scale=1280:720"
 
+        def pipeline_spec(self):
+            return None
+
     chain = FilterChain([NoopFilter(), FakeScaleFilter()])
     assert chain.render("any-url") == "scale=1280:720"
 
@@ -111,3 +114,29 @@ def test_filter_chain_binds_input_to_subtitleburnin():
     chain = FilterChain([stage])
     chain.render("/some/path.mkv")
     assert stage._input_url == "/some/path.mkv"
+
+
+# ---------- pipeline_spec() Protocol extension (P3.1) -----------------------
+
+def test_noop_pipeline_spec_returns_none():
+    """NoopFilter is a pure -vf filter; pipeline_spec() returns None."""
+    from castbooster.filter_chain import NoopFilter
+    assert NoopFilter().pipeline_spec() is None
+
+
+def test_subtitle_burnin_pipeline_spec_returns_none():
+    """SubtitleBurnIn is a pure -vf filter; pipeline_spec() returns None.
+
+    pipeline_spec() must not require _bind to have run — it doesn't depend
+    on input_url. Calling it on a fresh stage is valid.
+    """
+    from castbooster.filter_chain import SubtitleBurnIn
+    assert SubtitleBurnIn().pipeline_spec() is None
+
+
+def test_subtitle_burnin_pipeline_spec_returns_none_after_bind():
+    """Binding an input does not promote SubtitleBurnIn to a real spec."""
+    from castbooster.filter_chain import SubtitleBurnIn
+    stage = SubtitleBurnIn()
+    stage._bind("/some/path.mkv")
+    assert stage.pipeline_spec() is None

@@ -12,7 +12,10 @@ P3 will add RIFEFilter; P4 will add Anime4KFilter.
 """
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from castbooster.pipeline_spec import PipelineSpec
 
 
 class FilterStage(Protocol):
@@ -25,14 +28,23 @@ class FilterStage(Protocol):
     Optional method `_bind(input_url: str)` is called by FilterChain.render()
     before this stage's render() if present. SubtitleBurnIn uses this to
     learn the transcoder's input URL.
+
+    pipeline_spec() returns a PipelineSpec when the filter requires its own
+    process topology (e.g. RIFEFilter spawns a separate decode ffmpeg and a
+    Python side-task). Pure -vf filters return None — that's today's
+    single-Popen path with -vf <render()>.
     """
     def render(self) -> str: ...
+    def pipeline_spec(self) -> "PipelineSpec | None": ...
 
 
 class NoopFilter:
     """Identity filter — renders ffmpeg's `null` passthrough."""
     def render(self) -> str:
         return "null"
+
+    def pipeline_spec(self) -> "PipelineSpec | None":
+        return None
 
 
 class FilterChain:
@@ -126,3 +138,6 @@ class SubtitleBurnIn:
             )
         escaped = _escape_for_subtitles_filter(self._input_url)
         return f"subtitles={escaped}:si={self.stream_index}"
+
+    def pipeline_spec(self) -> "PipelineSpec | None":
+        return None
