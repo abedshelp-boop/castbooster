@@ -215,5 +215,84 @@ class RIFEFilter:
                 log.exception("rmtree of %s failed (will retry later)", d)
 
     def _side_task(self, ctx: SideTaskContext) -> None:
-        """Orchestrates decode -> rife -> encoder. Implemented in Tasks 5-6."""
-        raise NotImplementedError("RIFEFilter._side_task lands in P3.2 Tasks 5-6")
+        """Orchestrate decode -> batch -> rife -> encoder.
+
+        Runs synchronously on a thread spawned by P3.3's _ProcessSlot.
+        Checks ctx.cancel_event in the inner loop; returns promptly when set.
+        Raises on subprocess failure so the slot can mark FAILED.
+        """
+        frame_bytes = self._w * self._h * 3 // 2
+        frames_per_input_batch = int(round(self._source_fps * BATCH_SECONDS))
+        frames_per_output_batch = int(round(self._target_fps * BATCH_SECONDS))
+        input_chunk_size = frame_bytes * frames_per_input_batch
+
+        decode = self._spawn_decode(ctx.input_url)
+        batch_idx = 0
+        try:
+            while not ctx.cancel_event.is_set():
+                chunk = self._read_exact(decode.stdout, input_chunk_size)
+                if chunk is None or len(chunk) < input_chunk_size:
+                    # EOF or short read at end of stream -> stop cleanly.
+                    break
+
+                in_dir = ctx.workdir / "in" / str(batch_idx)
+                out_dir = ctx.workdir / "out" / str(batch_idx)
+                in_dir.mkdir(parents=True, exist_ok=True)
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                self._rawvideo_chunk_to_pngs(chunk, frames_per_input_batch, in_dir)
+                self._run_rife(in_dir, out_dir, frames_per_output_batch)
+                output_chunk = self._pngs_to_rawvideo_chunk(out_dir, frames_per_output_batch)
+                ctx.encoder_stdin.write(output_chunk)
+
+                # rmtree lag = 1: when we finish batch N, drop batch (N-2)'s dirs.
+                # batch N-1's dirs stay around until the next iteration.
+                self._cleanup_batch_dir(ctx.workdir, batch_idx - 2)
+
+                batch_idx += 1
+        finally:
+            # Terminate decode if still running (cancel or our raise).
+            try:
+                if decode.poll() is None:
+                    decode.terminate()
+                    try:
+                        decode.wait(timeout=2.0)
+                    except Exception:
+                        pass
+            except Exception:
+                log.exception("decode terminate failed")
+            # Cleanup remaining batch dirs.
+            self._cleanup_batch_dir(ctx.workdir, batch_idx - 2)
+            self._cleanup_batch_dir(ctx.workdir, batch_idx - 1)
+
+        # Decode failure detection: non-zero exit when we did NOT cancel and
+        # we did NOT stop because of an upstream EOF that we asked for.
+        rc = decode.poll()
+        if rc is not None and rc != 0 and not ctx.cancel_event.is_set():
+            stderr_bytes = b""
+            if decode.stderr is not None:
+                try:
+                    stderr_bytes = decode.stderr.read() or b""
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"decode ffmpeg exited {rc}: "
+                f"{stderr_bytes.decode('utf-8', 'replace')[:500] if stderr_bytes else ''}"
+            )
+
+    @staticmethod
+    def _read_exact(stream, n: int) -> Optional[bytes]:
+        """Read exactly n bytes from a binary stream, or whatever is left at EOF.
+
+        Returns None if the stream is closed; returns a possibly-short bytes
+        object at EOF.
+        """
+        if stream is None:
+            return None
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = stream.read(n - len(buf))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return bytes(buf)

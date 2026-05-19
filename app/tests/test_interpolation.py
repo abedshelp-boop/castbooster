@@ -342,3 +342,200 @@ def test_cleanup_batch_dir_negative_index_noop(tmp_path):
     rife = RIFEFilter(source_fps=24.0, target_fps=60, width=64, height=64,
                       rife_path="/fake/rife", ffmpeg_path="/fake/ffmpeg")
     rife._cleanup_batch_dir(tmp_path, batch_idx=-1)
+
+
+# ---------- _side_task ------------------------------------------------------
+
+class _FakeDecodeProc:
+    """Stand-in for the decode ffmpeg Popen. stdout yields a fixed byte stream."""
+    def __init__(self, total_bytes: bytes, fail_with: "int | None" = None):
+        self.stdout = io.BytesIO(total_bytes)
+        self.stderr = io.BytesIO(b"")
+        self._fail_with = fail_with
+        self._terminated = False
+
+    def poll(self):
+        # Pretend we're still running until stdout drains; then exit.
+        if self.stdout.tell() >= len(self.stdout.getvalue()):
+            return self._fail_with if self._fail_with is not None else 0
+        return None
+
+    def terminate(self):
+        self._terminated = True
+
+    def wait(self, timeout=None):
+        return self._fail_with if self._fail_with is not None else 0
+
+    @property
+    def returncode(self):
+        return self._fail_with if self._fail_with is not None else 0
+
+
+def _build_ctx(tmp_path, encoder_stdin=None):
+    """Convenience: build a SideTaskContext with sensible defaults."""
+    from castbooster.pipeline_spec import SideTaskContext
+    if encoder_stdin is None:
+        encoder_stdin = io.BytesIO()
+    workdir = tmp_path / "wd"
+    workdir.mkdir(parents=True, exist_ok=True)
+    return SideTaskContext(
+        input_url="http://upstream/x.m3u8",
+        target_fps=60,
+        encoder_stdin=encoder_stdin,
+        workdir=workdir,
+        cancel_event=threading.Event(),
+    )
+
+
+def _make_rife_with_stubs(tmp_path, monkeypatch, *,
+                          source_fps=24.0, target_fps=60, w=64, h=64,
+                          decode_bytes=None, decode_fail=None,
+                          rife_fail=False, raw_to_pngs_fail=False,
+                          pngs_to_raw_fail=False):
+    """Construct a RIFEFilter with all subprocess helpers stubbed."""
+    from castbooster.filters.interpolation import RIFEFilter
+
+    rife = RIFEFilter(source_fps=source_fps, target_fps=target_fps,
+                      width=w, height=h,
+                      rife_path="/fake/rife", ffmpeg_path="/fake/ffmpeg")
+
+    # _spawn_decode returns a fixed fake proc
+    if decode_bytes is None:
+        # default: 2 full input batches' worth of yuv420p frames
+        frame_size = w * h * 3 // 2
+        frames_per_batch = round(source_fps * 2)  # BATCH_SECONDS
+        decode_bytes = b"\xAB" * (frame_size * frames_per_batch * 2)
+    fake_decode = _FakeDecodeProc(decode_bytes, fail_with=decode_fail)
+    monkeypatch.setattr(rife, "_spawn_decode", lambda url: fake_decode)
+
+    # _rawvideo_chunk_to_pngs writes target_count empty PNG files (placeholders)
+    def _fake_raw_to_pngs(chunk, frame_count, in_dir):
+        if raw_to_pngs_fail:
+            raise RuntimeError("forced raw->PNG failure")
+        in_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(1, frame_count + 1):
+            (in_dir / f"{i:08d}.png").write_bytes(b"FAKEPNG")
+    monkeypatch.setattr(rife, "_rawvideo_chunk_to_pngs", _fake_raw_to_pngs)
+
+    # _run_rife "produces" target_count PNGs in out_dir
+    def _fake_run_rife(in_dir, out_dir, target_count):
+        if rife_fail:
+            raise RuntimeError("forced rife failure")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(1, target_count + 1):
+            (out_dir / f"{i:08d}.png").write_bytes(b"FAKEPNG_OUT")
+    monkeypatch.setattr(rife, "_run_rife", _fake_run_rife)
+
+    # _pngs_to_rawvideo_chunk returns N target frames worth of zeros
+    frame_size = w * h * 3 // 2
+    def _fake_pngs_to_raw(out_dir, frame_count):
+        if pngs_to_raw_fail:
+            raise RuntimeError("forced PNG->raw failure")
+        return b"\x00" * (frame_size * frame_count)
+    monkeypatch.setattr(rife, "_pngs_to_rawvideo_chunk", _fake_pngs_to_raw)
+
+    return rife, fake_decode
+
+
+def test_side_task_one_batch_writes_target_fps_rawvideo(tmp_path, monkeypatch):
+    """One full input batch -> one full output batch worth of rawvideo to encoder_stdin."""
+    # Provide just 1 batch of decode bytes
+    frame_size = 64 * 64 * 3 // 2
+    decode_bytes = b"\xAB" * (frame_size * 48)  # 48 frames @ source_fps=24 * 2s
+    rife, _ = _make_rife_with_stubs(tmp_path, monkeypatch, decode_bytes=decode_bytes)
+
+    ctx = _build_ctx(tmp_path)
+    rife._side_task(ctx)
+
+    # 60fps * 2s = 120 output frames * 6144 bytes = 737280 bytes
+    expected_bytes = frame_size * 120
+    assert ctx.encoder_stdin.tell() == expected_bytes
+
+
+def test_side_task_two_batches(tmp_path, monkeypatch):
+    """Two full input batches -> two output batches written to encoder_stdin."""
+    rife, _ = _make_rife_with_stubs(tmp_path, monkeypatch)
+    ctx = _build_ctx(tmp_path)
+    rife._side_task(ctx)
+    frame_size = 64 * 64 * 3 // 2
+    assert ctx.encoder_stdin.tell() == frame_size * 120 * 2
+
+
+def test_side_task_stops_at_eof(tmp_path, monkeypatch):
+    """Short read from decode (fewer than full batch) -> loop exits cleanly."""
+    frame_size = 64 * 64 * 3 // 2
+    partial = b"\xAB" * (frame_size * 5)  # 5 frames, less than 48 = 1 batch
+    rife, _ = _make_rife_with_stubs(tmp_path, monkeypatch, decode_bytes=partial)
+    ctx = _build_ctx(tmp_path)
+    rife._side_task(ctx)
+    # No batches completed -> no output bytes
+    assert ctx.encoder_stdin.tell() == 0
+
+
+def test_side_task_respects_cancel_event(tmp_path, monkeypatch):
+    """Setting cancel_event causes _side_task to return at the next batch boundary."""
+    rife, _ = _make_rife_with_stubs(tmp_path, monkeypatch)
+    ctx = _build_ctx(tmp_path)
+    ctx.cancel_event.set()  # set BEFORE first batch
+    rife._side_task(ctx)
+    # cancel before any batch -> no output
+    assert ctx.encoder_stdin.tell() == 0
+
+
+def test_side_task_raises_on_decode_nonzero(tmp_path, monkeypatch):
+    """Decode ffmpeg exits non-zero (not from cancel) -> side task raises."""
+    frame_size = 64 * 64 * 3 // 2
+    decode_bytes = b"\xAB" * (frame_size * 48)  # 1 batch then EOF
+    rife, fake_decode = _make_rife_with_stubs(
+        tmp_path, monkeypatch, decode_bytes=decode_bytes, decode_fail=1,
+    )
+    ctx = _build_ctx(tmp_path)
+    with pytest.raises(RuntimeError, match="decode ffmpeg"):
+        rife._side_task(ctx)
+
+
+def test_side_task_raises_on_rife_failure(tmp_path, monkeypatch):
+    """_run_rife raises -> side task propagates."""
+    rife, _ = _make_rife_with_stubs(tmp_path, monkeypatch, rife_fail=True)
+    ctx = _build_ctx(tmp_path)
+    with pytest.raises(RuntimeError, match="forced rife failure"):
+        rife._side_task(ctx)
+
+
+def test_side_task_raises_on_raw_to_pngs_failure(tmp_path, monkeypatch):
+    """_rawvideo_chunk_to_pngs raises -> side task propagates."""
+    rife, _ = _make_rife_with_stubs(tmp_path, monkeypatch, raw_to_pngs_fail=True)
+    ctx = _build_ctx(tmp_path)
+    with pytest.raises(RuntimeError, match="forced raw"):
+        rife._side_task(ctx)
+
+
+def test_side_task_cleanup_lag_calls(tmp_path, monkeypatch):
+    """Verify rmtree lag=1: cleanup(N-2) fires after each batch N; final
+    finally block cleans up the last two batches that weren't reached by
+    the in-loop cleanup.
+
+    For 4 batches, the cleanup call sequence must be:
+        in-loop:   cleanup(-2), cleanup(-1), cleanup(0), cleanup(1)
+        finally:   cleanup(2), cleanup(3)
+
+    Tracks via monkeypatching _cleanup_batch_dir — robust against
+    incidental dir creation/removal by other stubs.
+    """
+    rife, _ = _make_rife_with_stubs(tmp_path, monkeypatch,
+                                    decode_bytes=b"\xAB" * (64 * 64 * 3 // 2 * 48 * 4))
+
+    cleanup_calls: list[int] = []
+    orig_cleanup = rife._cleanup_batch_dir
+    def _track_cleanup(workdir, batch_idx):
+        cleanup_calls.append(batch_idx)
+        orig_cleanup(workdir, batch_idx)
+    monkeypatch.setattr(rife, "_cleanup_batch_dir", _track_cleanup)
+
+    ctx = _build_ctx(tmp_path)
+    rife._side_task(ctx)
+
+    # 4 in-loop calls (one per batch, with N-2 indices) + 2 finally calls
+    assert cleanup_calls == [-2, -1, 0, 1, 2, 3], (
+        f"unexpected cleanup sequence: {cleanup_calls}"
+    )
