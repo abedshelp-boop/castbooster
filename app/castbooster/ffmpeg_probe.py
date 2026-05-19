@@ -364,3 +364,79 @@ def detect(ffmpeg_path_override: Optional[str] = None) -> AccelProfile:
         profile.tier, profile.encoder, profile.decoder,
     )
     return profile
+
+
+def probe_input_video(
+    url: str,
+    ffmpeg_path: Optional[str] = None,
+) -> Optional[InputVideoInfo]:
+    """Probe a video URL for fps / dimensions / pix_fmt via ffprobe.
+
+    Runs `ffprobe -hide_banner -loglevel error -show_streams -select_streams v:0
+    -of json <url>` and parses the first video stream's metadata.
+
+    Args:
+        url: input URL (HLS m3u8, mp4, file://, etc.).
+        ffmpeg_path: optional override; defaults to detect().ffmpeg_path.
+            (Used in tests; production callers can rely on the default.)
+
+    Returns:
+        InputVideoInfo on a successful probe with a video stream present.
+        None on any failure mode:
+            - ffprobe binary not found next to ffmpeg
+            - subprocess timeout, crash, or non-zero exit
+            - ffprobe stdout is not valid JSON
+            - JSON has an empty 'streams' array (no video stream after
+              -select_streams v:0 — happens on audio-only inputs)
+            - first stream is missing required fields (width/height/pix_fmt)
+
+    CFR fps semantics:
+        fps = parse(r_frame_rate) iff r_frame_rate == avg_frame_rate.
+        Otherwise (including avg_frame_rate == "0/0", which is ffprobe's
+        unknown-duration sentinel for HLS): fps = None — caller treats as
+        VFR and skips interpolation but still allows passthrough cast.
+    """
+    if ffmpeg_path is None:
+        ffmpeg_path = detect().ffmpeg_path
+    ffprobe = _locate_ffprobe(ffmpeg_path)
+    if ffprobe is None:
+        log.warning("ffprobe not found next to %s", ffmpeg_path)
+        return None
+    args = [
+        ffprobe, "-hide_banner", "-loglevel", "error",
+        "-show_streams", "-select_streams", "v:0",
+        "-of", "json", url,
+    ]
+    try:
+        result = _run(args, timeout=_VIDEO_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.warning("ffprobe timed out on %s", url)
+        return None
+    except Exception:
+        log.exception("ffprobe crashed on %s", url)
+        return None
+    if result.returncode != 0:
+        log.warning(
+            "ffprobe failed (exit=%d) on %s: %s",
+            result.returncode, url, (result.stderr or "")[:200],
+        )
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except ValueError:
+        log.warning("ffprobe returned malformed JSON on %s", url)
+        return None
+    streams = data.get("streams") or []
+    if not streams:
+        return None
+    s = streams[0]
+    try:
+        width = int(s["width"])
+        height = int(s["height"])
+        pix_fmt = str(s["pix_fmt"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    r = s.get("r_frame_rate") or ""
+    a = s.get("avg_frame_rate") or ""
+    fps = _parse_rational_fps(r) if r and r == a else None
+    return InputVideoInfo(fps=fps, width=width, height=height, pix_fmt=pix_fmt)

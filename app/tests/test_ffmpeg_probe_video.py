@@ -112,3 +112,28 @@ def test_input_video_info_holds_all_fields():
     assert info.width == 640
     assert info.height == 360
     assert info.pix_fmt == "yuv420p"
+
+
+# ---------- probe_input_video happy path (V1) -------------------------------
+
+def test_probe_returns_info_for_cfr_input(tmp_path, monkeypatch):
+    """CFR input (r == a) → returns InputVideoInfo with parsed fps."""
+    # Stub _locate_ffprobe to return a known path so we don't depend on the
+    # filesystem layout. Stub _run to return the CFR fixture JSON.
+    monkeypatch.setattr(
+        ffmpeg_probe, "_locate_ffprobe",
+        lambda ffmpeg_path: "fake-ffprobe",
+    )
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, timeout: _completed(0, stdout=_load("ffprobe_cfr_1080p.json")),
+    )
+    info = ffmpeg_probe.probe_input_video(
+        "http://example.com/x.m3u8",
+        ffmpeg_path="fake-ffmpeg",
+    )
+    assert info is not None
+    assert info.fps == pytest.approx(23.976, rel=1e-3)
+    assert info.width == 1920
+    assert info.height == 1080
+    assert info.pix_fmt == "yuv420p"
