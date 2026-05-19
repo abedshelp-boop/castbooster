@@ -29,3 +29,31 @@ class RIFENotFoundError(RuntimeError):
 def is_pro() -> bool:
     """Stub for P3. P6 wires real Polar.sh JWT validation here."""
     return True
+
+
+_BUNDLED_RIFE = Path(__file__).parent / "bin" / "rife-ncnn-vulkan.exe"
+
+
+def _locate_rife(override: Optional[str] = None) -> str:
+    """Find rife-ncnn-vulkan in priority order: override arg, env, bundled, PATH.
+
+    Returns the absolute path. Raises RIFENotFoundError if none of the
+    candidates point at a real file. Mirrors ffmpeg_probe.locate_ffmpeg().
+    """
+    candidates: List[Optional[str]] = []
+    if override:
+        candidates.append(override)
+    env = os.environ.get("CASTBOOSTER_RIFE")
+    if env:
+        candidates.append(env)
+    candidates.append(str(_BUNDLED_RIFE))
+    path_lookup = shutil.which("rife-ncnn-vulkan")
+    if path_lookup:
+        candidates.append(path_lookup)
+    for c in candidates:
+        if c and Path(c).is_file():
+            return str(Path(c).resolve())
+    raise RIFENotFoundError(
+        f"rife-ncnn-vulkan not found. Tried: {candidates}. "
+        f"Run app/scripts/fetch_rife.ps1 to download it."
+    )
