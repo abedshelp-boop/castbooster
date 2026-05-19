@@ -137,3 +137,94 @@ def test_probe_returns_info_for_cfr_input(monkeypatch):
     assert info.width == 1920
     assert info.height == 1080
     assert info.pix_fmt == "yuv420p"
+
+
+# ---------- probe_input_video failure modes (V2-V9) ------------------------
+
+def test_probe_returns_fps_none_for_vfr_input(monkeypatch):
+    """r_frame_rate != avg_frame_rate → fps=None; other fields preserved."""
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: "fake")
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, *, timeout: _completed(0, stdout=_load("ffprobe_vfr_mismatch.json")),
+    )
+    info = ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake")
+    assert info is not None
+    assert info.fps is None
+    assert info.width == 1280
+    assert info.height == 720
+    assert info.pix_fmt == "yuv420p"
+
+
+def test_probe_returns_fps_none_when_avg_frame_rate_zero(monkeypatch):
+    """avg_frame_rate == '0/0' (HLS-unknown-duration) → fps=None; dims kept."""
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: "fake")
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, *, timeout: _completed(0, stdout=_load("ffprobe_avg_zero.json")),
+    )
+    info = ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake")
+    assert info is not None
+    assert info.fps is None
+    assert info.width == 1920
+    assert info.height == 1080
+    assert info.pix_fmt == "yuv420p"
+
+
+def test_probe_returns_none_when_no_video_stream(monkeypatch):
+    """Audio-only input → empty streams array after -select_streams v:0."""
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: "fake")
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, *, timeout: _completed(0, stdout=_load("ffprobe_no_video.json")),
+    )
+    assert ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake") is None
+
+
+def test_probe_returns_none_on_missing_fields(monkeypatch):
+    """Video stream lacks width → can't build an InputVideoInfo → None."""
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: "fake")
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, *, timeout: _completed(0, stdout=_load("ffprobe_missing_fields.json")),
+    )
+    assert ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake") is None
+
+
+def test_probe_returns_none_on_subprocess_failure(monkeypatch):
+    """Non-zero ffprobe exit → None."""
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: "fake")
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, *, timeout: _completed(1, stderr="ffprobe: bogus URL"),
+    )
+    assert ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake") is None
+
+
+def test_probe_returns_none_on_timeout(monkeypatch):
+    """subprocess.TimeoutExpired propagates as a probe failure → None."""
+    def _raise_timeout(args, *, timeout):
+        raise subprocess.TimeoutExpired(cmd="ffprobe", timeout=10)
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: "fake")
+    monkeypatch.setattr(ffmpeg_probe, "_run", _raise_timeout)
+    assert ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake") is None
+
+
+def test_probe_returns_none_on_malformed_json(monkeypatch):
+    """Non-JSON stdout → None (no exception leaks)."""
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: "fake")
+    monkeypatch.setattr(
+        ffmpeg_probe, "_run",
+        lambda args, *, timeout: _completed(0, stdout="this is not json {{"),
+    )
+    assert ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake") is None
+
+
+def test_probe_returns_none_when_ffprobe_missing(monkeypatch):
+    """No sibling ffprobe → None without ever invoking _run."""
+    monkeypatch.setattr(ffmpeg_probe, "_locate_ffprobe", lambda p: None)
+    # Sentinel that fails the test if _run is called.
+    def _fail(*args, **kwargs):
+        raise AssertionError("_run must not be called when ffprobe is missing")
+    monkeypatch.setattr(ffmpeg_probe, "_run", _fail)
+    assert ffmpeg_probe.probe_input_video("x", ffmpeg_path="fake") is None
