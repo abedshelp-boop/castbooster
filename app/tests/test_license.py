@@ -77,3 +77,103 @@ def test_locate_rife_raises_when_nothing_found(tmp_path, monkeypatch):
     monkeypatch.setattr(lic.shutil, "which", lambda _: None)
     with pytest.raises(lic.RIFENotFoundError):
         lic._locate_rife()
+
+
+# ---------- vulkan_available ------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_vulkan_cache():
+    """vulkan_available is @functools.cache'd — clear it between tests."""
+    from castbooster import license as lic
+    lic.vulkan_available.cache_clear()
+    yield
+    lic.vulkan_available.cache_clear()
+
+
+def test_vulkan_available_true_on_clean_exit(tmp_path, monkeypatch):
+    """Probe returns True when rife -h exits 0 with no Vulkan errors."""
+    from castbooster import license as lic
+    fake = tmp_path / "rife-ncnn-vulkan.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(lic, "_BUNDLED_RIFE", fake)
+    monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
+
+    def _fake_run(args, **kw):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(lic.subprocess, "run", _fake_run)
+    assert lic.vulkan_available() is True
+
+
+def test_vulkan_available_false_when_binary_missing(tmp_path, monkeypatch):
+    """No rife binary → False (and we do not crash with RIFENotFoundError)."""
+    from castbooster import license as lic
+    monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
+    monkeypatch.setattr(lic, "_BUNDLED_RIFE", tmp_path / "nope.exe")
+    monkeypatch.setattr(lic.shutil, "which", lambda _: None)
+    assert lic.vulkan_available() is False
+
+
+def test_vulkan_available_false_on_filenotfound(tmp_path, monkeypatch):
+    """subprocess.run raising FileNotFoundError → False."""
+    from castbooster import license as lic
+    fake = tmp_path / "rife-ncnn-vulkan.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(lic, "_BUNDLED_RIFE", fake)
+    monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("rife missing")
+    monkeypatch.setattr(lic.subprocess, "run", _raise)
+    assert lic.vulkan_available() is False
+
+
+def test_vulkan_available_false_on_timeout(tmp_path, monkeypatch):
+    """subprocess.run raising TimeoutExpired → False."""
+    from castbooster import license as lic
+    fake = tmp_path / "rife-ncnn-vulkan.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(lic, "_BUNDLED_RIFE", fake)
+    monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
+
+    def _raise(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd="rife", timeout=2.0)
+    monkeypatch.setattr(lic.subprocess, "run", _raise)
+    assert lic.vulkan_available() is False
+
+
+def test_vulkan_available_false_on_vulkan_error_stderr(tmp_path, monkeypatch):
+    """Even returncode 0 is treated as failure if stderr mentions vulkan errors."""
+    from castbooster import license as lic
+    fake = tmp_path / "rife-ncnn-vulkan.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(lic, "_BUNDLED_RIFE", fake)
+    monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
+
+    def _fake_run(args, **kw):
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="",
+            stderr="failed to find Vulkan device",
+        )
+    monkeypatch.setattr(lic.subprocess, "run", _fake_run)
+    assert lic.vulkan_available() is False
+
+
+def test_vulkan_available_is_cached(tmp_path, monkeypatch):
+    """Repeated calls hit the @functools.cache, not the subprocess."""
+    from castbooster import license as lic
+    fake = tmp_path / "rife-ncnn-vulkan.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(lic, "_BUNDLED_RIFE", fake)
+    monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
+
+    calls = {"n": 0}
+
+    def _fake_run(args, **kw):
+        calls["n"] += 1
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(lic.subprocess, "run", _fake_run)
+    assert lic.vulkan_available() is True
+    assert lic.vulkan_available() is True
+    assert lic.vulkan_available() is True
+    assert calls["n"] == 1
