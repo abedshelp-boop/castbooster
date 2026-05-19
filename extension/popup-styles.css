@@ -536,17 +536,6 @@
   background-position: center, center;
   background-repeat: no-repeat, no-repeat;
   box-shadow: 0 12px 36px -10px rgba(59,142,255,0.6), 0 0 0 1px rgba(59,142,255,0.12) inset;
-  transition: background-image 220ms ease;
-}
-/* When a live frame is painted, JS sets data-has-frame="true" on .cb-stage,
-   which fades the placeholder silhouette + stagetv chrome so the frame reads. */
-.cb-stage[data-has-frame="true"] .silhouette,
-.cb-stage[data-has-frame="true"] .stagetv { opacity: 0; }
-.cb-stage[data-has-frame="true"]::after {
-  content: '';
-  position: absolute; inset: 0;
-  background: linear-gradient(180deg, rgba(0,0,0,0) 30%, rgba(0,0,0,0.55) 100%);
-  pointer-events: none;
 }
 .cb-stage .silhouette {
   position: absolute;
@@ -558,23 +547,6 @@
     radial-gradient(35% 90% at 85% 100%, #0a1830 0%, transparent 70%);
   clip-path: polygon(0 60%, 18% 30%, 35% 55%, 55% 18%, 72% 45%, 88% 25%, 100% 50%, 100% 100%, 0 100%);
   opacity: 0.7;
-  transition: opacity 200ms ease;
-}
-.cb-stage-note {
-  position: absolute;
-  left: 50%; bottom: 12px;
-  transform: translateX(-50%);
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 9.5px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--cb-text-dim);
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: rgba(0,0,0,0.5);
-  border: 1px solid var(--cb-line);
-  backdrop-filter: blur(4px);
-  z-index: 2;
 }
 .cb-stage .live {
   position: absolute;
@@ -629,9 +601,6 @@
     0 0 24px rgba(59,142,255,0.6);
   color: #fff;
   animation: cb-halo-breathe 3.2s ease-in-out infinite;
-}
-.cb-stage .stagetv {
-  transition: opacity 200ms ease;
 }
 .cb-stage .stagetv .lbl {
   font-size: 11px; font-weight: 600; color: #fff;

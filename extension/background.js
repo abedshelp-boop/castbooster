@@ -257,14 +257,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         (incoming.paused === false && cur.paused === true) ||
         (incoming.width * incoming.height > (cur.width || 0) * (cur.height || 0))
       ) {
-        s.dom = {
-          ...incoming,
-          // Track which frame the <video> lives in so the popup can target
-          // GET_FRAME at that specific frame instead of broadcasting (which
-          // races against the top frame and loses on iframe-player sites).
-          frameId: typeof sender.frameId === 'number' ? sender.frameId : 0,
-          reportedAt: Date.now(),
-        };
+        s.dom = { ...incoming, reportedAt: Date.now() };
       }
       return;
     }
@@ -400,21 +393,12 @@ async function handleCastNow(msg) {
       const found = (list && list.casts || []).find((c) => c.uuid === msg.castUuid);
       if (found) deviceName = found.name || '';
     } catch (_) { /* non-fatal */ }
-    // Pick up the frame id of whatever frame reported the <video> so the popup
-    // can target GET_FRAME at that specific frame. Falls back to null when no
-    // DOM detection has happened yet (e.g. cast URL came from webRequest only)
-    // — popup will broadcast in that case.
-    const domRecord = (tabState.get(msg.tabId) || {}).dom;
-    const sourceFrameId =
-      domRecord && typeof domRecord.frameId === 'number' ? domRecord.frameId : null;
     await chrome.storage.local.set({
       activeCast: {
         castUuid: msg.castUuid,
         deviceName,
         token: reg.token,
         upstreamUrl: msg.url,
-        sourceTabId: msg.tabId,
-        sourceFrameId,
         startedAt: Date.now(),
       },
     });

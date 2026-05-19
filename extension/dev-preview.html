@@ -198,7 +198,6 @@
           </div>
           <div class="lbl">Casting to <span id="mcDeviceNameStage">—</span></div>
         </div>
-        <div class="cb-stage-note" id="mcStageNote" hidden>preview unavailable</div>
       </div>
     </div>
 
@@ -293,7 +292,6 @@
       castUuid: SAMPLE_DEVICES[0].uuid,
       deviceName: SAMPLE_DEVICES[0].name,
       upstreamUrl: 'https://plex.local/library/movie/the-northman',
-      sourceTabId: 1,
       startedAt: Date.now() - 5 * 60 * 1000,
     };
     function mediaStatusForMode() {
@@ -336,24 +334,6 @@
       },
       tabs: {
         query: async () => [{ id: 1, url: 'https://example-streaming.com/watch' }],
-        sendMessage: async (_tabId, msg) => {
-          if (msg && msg.type === 'GET_FRAME') {
-            // Tiny inline 16:9 SVG so we can see the stage background change.
-            const svg = encodeURIComponent(
-              '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 135">' +
-              '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">' +
-              '<stop offset="0%" stop-color="#2a3a78"/><stop offset="100%" stop-color="#0a1a4a"/>' +
-              '</linearGradient></defs>' +
-              '<rect width="240" height="135" fill="url(#g)"/>' +
-              '<circle cx="120" cy="68" r="22" fill="#fff" opacity="0.9"/>' +
-              '<polygon points="113,58 113,78 132,68" fill="#0a1a4a"/>' +
-              '<text x="12" y="124" font-family="monospace" font-size="10" fill="#aac3ff">preview frame</text>' +
-              '</svg>'
-            );
-            return { frame: 'data:image/svg+xml;utf8,' + svg };
-          }
-          return null;
-        },
       },
       storage: {
         local: {

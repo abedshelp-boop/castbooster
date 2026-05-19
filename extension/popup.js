@@ -26,7 +26,6 @@ const mcDevice = document.getElementById('mcDevice');
 const mcResBadge = document.getElementById('mcResBadge');
 const mcDeviceNameStage = document.getElementById('mcDeviceNameStage');
 const mcStage = document.getElementById('mcStage');
-const mcStageNote = document.getElementById('mcStageNote');
 const mcCurrent = document.getElementById('mcCurrent');
 const mcDuration = document.getElementById('mcDuration');
 const mcScrubber = document.getElementById('mcScrubber');
@@ -51,8 +50,6 @@ let lastPlayPauseAt = 0;    // debounce rapid toggles
 let currentVolume = 0.5;    // tracked locally so +/- can step from a known value
 let volReadoutTimer = null; // fade-out timer for the % readout
 let lastOptimisticSeekAt = 0;  // suppresses scrubber snap-back after skip
-let frameBlocked = false;   // source tab's <video> canvas is tainted; stop polling frames
-let lastFrameDataUrl = '';  // last good frame; reused if a poll returns idle/blocked
 
 // Copy of the ad-CDN check from background.js — popup needs it client-side to
 // label ad hosts in the dropdown.
@@ -422,27 +419,12 @@ function showPlayerMode() {
   setHint('');
   // Light up the ambient broadcast bias-light under the popup.
   document.body.classList.add('broadcasting');
-  // Fresh session — clear any stage frame state from a previous cast.
-  resetStageFrame();
 }
 
 function showPickerMode() {
   playerArea.hidden = true;
   document.body.classList.remove('broadcasting');
   stopPolling();
-  resetStageFrame();
-}
-
-function resetStageFrame() {
-  frameBlocked = false;
-  lastFrameDataUrl = '';
-  if (mcStage) {
-    mcStage.style.backgroundImage = '';
-    mcStage.style.backgroundSize = '';
-    mcStage.style.backgroundPosition = '';
-    delete mcStage.dataset.hasFrame;
-  }
-  if (mcStageNote) mcStageNote.hidden = true;
 }
 
 // Map a media_status payload onto the single-stage player UI. Only the
@@ -529,56 +511,6 @@ function updatePlayerUi(status) {
   playerArea.dataset.state = dead ? 'dead' : (state === 'BUFFERING' ? 'buffering' : (state === 'PLAYING' ? 'playing' : 'paused'));
 }
 
-// ---------------------------------------------------------------------------
-// Live frame painting (source-tab <video> → stage background)
-// ---------------------------------------------------------------------------
-
-async function paintStageFromSourceTab() {
-  if (frameBlocked) return;
-  const tabId = activeCast && activeCast.sourceTabId;
-  if (!tabId) return;
-  // Target the specific frame that owns the <video> when we know it. Without
-  // this, chrome.tabs.sendMessage broadcasts to every frame and the first
-  // sendResponse wins — on iframe-player sites (e.g. egydead → streamtape)
-  // the top frame's "no video" idle response races ahead of the iframe's
-  // real frame, so we never paint anything.
-  const frameId = activeCast && activeCast.sourceFrameId;
-  const hasFrameId = typeof frameId === 'number' && frameId >= 0;
-  let resp;
-  try {
-    resp = hasFrameId
-      ? await chrome.tabs.sendMessage(tabId, { type: 'GET_FRAME' }, { frameId })
-      : await chrome.tabs.sendMessage(tabId, { type: 'GET_FRAME' });
-  } catch (_) {
-    // Tab closed, content script not injected, or extension reload — silently skip.
-    return;
-  }
-  if (!resp) return;
-  if (resp.blocked) {
-    frameBlocked = true;
-    if (mcStageNote) {
-      mcStageNote.textContent = 'preview unavailable';
-      mcStageNote.hidden = false;
-    }
-    return;
-  }
-  if (resp.idle) return;  // no playing video; keep last good frame
-  if (resp.frame) {
-    lastFrameDataUrl = resp.frame;
-    if (mcStage) {
-      // Layer the frame UNDER the existing gradients so the "On Air" / res
-      // badges and overlays stay readable.
-      mcStage.style.backgroundImage =
-        `linear-gradient(180deg, rgba(0,0,0,0) 50%, rgba(0,0,0,0.45) 100%), ` +
-        `url("${resp.frame}")`;
-      mcStage.style.backgroundSize = 'cover, cover';
-      mcStage.style.backgroundPosition = 'center, center';
-      mcStage.dataset.hasFrame = 'true';
-    }
-    if (mcStageNote) mcStageNote.hidden = true;
-  }
-}
-
 // Grace window after cast start — during the first few seconds the Chromecast
 // reports IDLE+reason=None before transitioning to BUFFERING/PLAYING. Clearing
 // the session then would bounce the user back to the picker right after they
@@ -631,9 +563,6 @@ async function pollOnce() {
     return;
   }
   updatePlayerUi(status);
-  // Piggyback a frame request on the same tick — keeps the stage in sync
-  // with whatever's actually playing on the source tab.
-  paintStageFromSourceTab();
   // Dead session (IDLE+ERROR): stop polling — nothing will change until the
   // user dismisses. Controls are already disabled in updatePlayerUi.
   if (isDeadSession(status)) return;
