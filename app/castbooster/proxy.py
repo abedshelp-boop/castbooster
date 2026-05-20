@@ -13,11 +13,13 @@ from aiohttp import ClientSession, ClientTimeout, web
 
 from castbooster import __version__
 from castbooster import ffmpeg_probe
+from castbooster import license
 from castbooster.caster import CastManager
 from castbooster.ffmpeg_probe import (
     AccelProfile, FFmpegNotFoundError, FFmpegProbeError,
 )
 from castbooster.filter_chain import FilterChain, NoopFilter
+from castbooster.filters.interpolation import RIFEFilter
 from castbooster.hls_rewriter import decode_url, rewrite_playlist
 from castbooster.netinfo import get_lan_ip
 from castbooster.output_dir_sweep import sweep_stranded_output_dirs
@@ -152,17 +154,72 @@ async def _handle_list_casts(app: web.Application, _msg: dict) -> dict:
     return {"type": "casts", "casts": casts}
 
 
+async def _handle_capabilities(_app: web.Application, _msg: dict) -> dict:
+    """Report the Pillar-3 'Smooth motion' premium gate state to the popup.
+
+    Returns whether the user has a Pro license AND whether the local machine
+    can run rife-ncnn-vulkan. Popup hides the toggle unless both are True.
+    Both calls are cached at the module level — this handler is O(1).
+    """
+    return {
+        "type": "capabilities",
+        "is_pro": license.is_pro(),
+        "vulkan_available": license.vulkan_available(),
+    }
+
+
+_VFR_INFO = "Smoothness skipped — source frame rate not detectable"
+
+
+def _build_filter_chain(
+    enable_smooth: bool,
+    caps,
+    video,
+) -> tuple[FilterChain, Optional[str]]:
+    """Spec §4.2 decision tree.
+
+    Returns (chain, info_message_or_None). The info_message is surfaced to
+    the popup via the cast/set_filter_chain response so the user knows when
+    we silently fell back to NoopFilter despite enable_smooth=True.
+
+    Args:
+        enable_smooth: popup toggle state.
+        caps: ReceiverCaps for the target Chromecast.
+        video: InputVideoInfo from probe_input_video, or None if probe failed.
+    """
+    if caps.audio_only or not enable_smooth or not license.is_pro() or video is None:
+        return FilterChain([NoopFilter()]), None
+    target_fps = caps.max_fps
+    if video.fps is None:
+        return FilterChain([NoopFilter()]), _VFR_INFO
+    if video.fps >= target_fps:
+        return FilterChain([NoopFilter()]), None
+    rife = RIFEFilter(
+        source_fps=video.fps, target_fps=target_fps,
+        width=video.width, height=video.height,
+    )
+    return FilterChain([rife]), None
+
+
 async def _handle_cast(app: web.Application, msg: dict) -> dict:
     """Spawn (or skip) a transcoder, READY-gate, fall back on FAILED.
 
     See spec docs/superpowers/specs/2026-05-15-pillar-2.4-proxy-integration-design.md §3.2.
+    P3.4: reads `enable_smooth` from the popup, runs the §4.2 decision tree to
+    pick NoopFilter vs RIFEFilter, surfaces an info_message on VFR fallback.
     """
     token = msg.get("token")
     cast_uuid = msg.get("castUuid")
+    enable_smooth = bool(msg.get("enable_smooth", False))
     if not token or not isinstance(token, str):
         return {"type": "casting", "status": "error", "detail": "missing 'token'"}
     if not cast_uuid or not isinstance(cast_uuid, str):
         return {"type": "casting", "status": "error", "detail": "missing 'castUuid'"}
+    # Defense-in-depth: refuse smoothness if the proxy disagrees with the
+    # popup about pro status. (Popup hides the toggle when !is_pro, but a
+    # tampered popup could still send enable_smooth=True.)
+    if enable_smooth and not license.is_pro():
+        return {"type": "casting", "status": "error", "detail": "pro required"}
     store: SessionStore = app["session_store"]
     sess = store.get(token)
     if sess is None:
@@ -192,22 +249,42 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
         sess.passthrough_only = True
 
     # Step 4: maybe spawn the transcoder
+    info_message: Optional[str] = None
     if not sess.passthrough_only:
         warming_timeout = _WARMING_TIMEOUT_BY_TIER.get(accel.tier, 12.0)
         base_output_dir = Path(tempfile.gettempdir()) / "castbooster" / token
         upstream_loopback_url = (
             f"http://127.0.0.1:{PROXY_PORT}/s/{token}/upstream/master.m3u8"
         )
+        # P3.4: pick NoopFilter vs RIFEFilter per spec §4.2. caps lookup is
+        # cheap (in-memory table); probe_input_video runs ffprobe in a
+        # subprocess so it goes in the executor.
+        caps = cm.capabilities(cast_uuid)
+        video = await loop.run_in_executor(
+            None, ffmpeg_probe.probe_input_video, sess.upstream_url,
+        )
+        # Cache for _handle_set_filter_chain so the toggle doesn't re-probe
+        # ffprobe every time the user flips it.
+        sess.cast_uuid = cast_uuid
+        sess.probed_video = video
+        filter_chain, info_message = _build_filter_chain(
+            enable_smooth=enable_smooth, caps=caps, video=video,
+        )
         log.info(
-            "[cast token=%s] spawning transcoder accel=%s/%s/%s budget=%.1fs base=%s",
+            "[cast token=%s] spawning transcoder accel=%s/%s/%s budget=%.1fs "
+            "smooth=%s chain=%s base=%s",
             log_token, accel.encoder, accel.decoder, accel.tier,
-            warming_timeout, base_output_dir,
+            warming_timeout, enable_smooth,
+            "rife" if filter_chain.stages and not isinstance(
+                filter_chain.stages[0], NoopFilter
+            ) else "noop",
+            base_output_dir,
         )
         transcoder = Transcoder(
             input_url=upstream_loopback_url,
             base_output_dir=base_output_dir,
             accel=accel,
-            filter_chain=FilterChain([NoopFilter()]),
+            filter_chain=filter_chain,
             warming_timeout=warming_timeout,
         )
         sess.transcoder = transcoder
@@ -299,12 +376,15 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
             "detail": f"play_media failed: {e}",
         }
     log.info("[cast token=%s] play_media → %s", log_token, playback_url)
-    return {
+    resp: Dict[str, Any] = {
         "type": "casting",
         "status": "ok",
         "detail": f"Playback started on {name}",
         "playbackUrl": playback_url,
     }
+    if info_message:
+        resp["info_message"] = info_message
+    return resp
 
 
 def _guess_manifest_path(url: str) -> tuple[str, str]:
@@ -432,6 +512,197 @@ async def _handle_media_status(app: web.Application, msg: dict) -> dict:
     return status
 
 
+async def _handle_set_filter_chain(app: web.Application, msg: dict) -> dict:
+    """Hot-reload the active session's filter chain in response to a popup
+    toggle change. Blocks on transcoder.set_filter_chain (executor), then
+    reports success or queues a popup_warning on failure.
+
+    Failure semantics: when set_filter_chain returns False, the OLD chain
+    keeps streaming. We don't need an explicit demote — the chain is
+    already what it was. We just surface the failure to the popup.
+
+    Defense-in-depth: rejects enable_smooth=True if !license.is_pro(), so
+    a tampered popup can't sneak past the gate.
+    """
+    token = msg.get("token")
+    enable_smooth = bool(msg.get("enable_smooth", False))
+    if not token or not isinstance(token, str):
+        return {"type": "filter_chain_set", "status": "error",
+                "detail": "missing 'token'"}
+    if enable_smooth and not license.is_pro():
+        return {"type": "filter_chain_set", "status": "error",
+                "detail": "pro required"}
+    store: SessionStore = app["session_store"]
+    sess = store.get(token)
+    if sess is None:
+        return {"type": "filter_chain_set", "status": "error",
+                "detail": "unknown token"}
+    transcoder = sess.transcoder
+    if transcoder is None:
+        return {"type": "filter_chain_set", "status": "error",
+                "detail": "no active transcoder for this session"}
+    cm: CastManager = app["cast_manager"]
+    log_token = token[:8]
+
+    if sess.cast_uuid is None:
+        return {"type": "filter_chain_set", "status": "error",
+                "detail": "session not initialized — cast first"}
+
+    caps = cm.capabilities(sess.cast_uuid)
+    chain, info_message = _build_filter_chain(
+        enable_smooth=enable_smooth, caps=caps, video=sess.probed_video,
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        success = await loop.run_in_executor(
+            None, transcoder.set_filter_chain, chain,
+        )
+    except RuntimeError as e:
+        log.warning(
+            "[set_filter_chain token=%s] transcoder rejected reload: %s",
+            log_token, e,
+        )
+        warning = "Smoothness reload not available right now"
+        sess.pending_warnings.append(warning)
+        return {
+            "type": "filter_chain_set", "status": "failed",
+            "enable_smooth_actual": transcoder.has_active_pipeline(),
+            "warning": warning,
+        }
+
+    actual_smooth = transcoder.has_active_pipeline()
+
+    if not success:
+        log.warning(
+            "[set_filter_chain token=%s] reload failed; old chain preserved "
+            "(last_reload_error=%s)",
+            log_token, transcoder.last_reload_error,
+        )
+        warning = "Smoothness unavailable — continuing without"
+        sess.pending_warnings.append(warning)
+        return {
+            "type": "filter_chain_set", "status": "failed",
+            "enable_smooth_actual": actual_smooth,
+            "warning": warning,
+        }
+
+    log.info(
+        "[set_filter_chain token=%s] reload ok; smooth=%s actual=%s",
+        log_token, enable_smooth, actual_smooth,
+    )
+    resp: Dict[str, Any] = {
+        "type": "filter_chain_set", "status": "ok",
+        "enable_smooth_actual": actual_smooth,
+    }
+    if info_message:
+        resp["info_message"] = info_message
+    return resp
+
+
+async def _handle_get_session_status(app: web.Application, msg: dict) -> dict:
+    """Popup polls this every few seconds during an active cast to learn the
+    true state of the transcoder and drain any pending warnings (queued by
+    _handle_set_filter_chain failure or _watchdog_tick demotes).
+
+    Drain semantics: warnings are returned once and then cleared. The popup
+    is responsible for displaying them. If the popup is closed when a
+    warning is queued, the warning is lost on the next drain — fire-and-
+    forget per Q3.
+    """
+    token = msg.get("token")
+    store: SessionStore = app["session_store"]
+    sess = store.get(token) if isinstance(token, str) else None
+    if sess is None or sess.transcoder is None:
+        return {
+            "type": "session_status",
+            "state": "no_session",
+            "enable_smooth_actual": False,
+            "warnings": [],
+        }
+    transcoder = sess.transcoder
+    warnings = list(sess.pending_warnings)
+    sess.pending_warnings.clear()
+    return {
+        "type": "session_status",
+        "state": transcoder.state.name.lower(),
+        "enable_smooth_actual": transcoder.has_active_pipeline(),
+        "warnings": warnings,
+    }
+
+
+# ---- P3.4 failure-detection watchdog --------------------------------------
+#
+# Scope (per session prompt + Q4): demote-to-NoopFilter when a multi-process
+# slot transitions FAILED while the chain still has an active pipeline. NO
+# perf thresholds, NO GPU temp monitoring — those live in Pillar 5.
+#
+# Tick cadence: 5s. Trade-off between detection latency (scenario #2 asks for
+# "continues passthrough" with a forgiving window) and idle CPU cost.
+
+_WATCHDOG_INTERVAL_SECONDS = 5.0
+_WATCHDOG_DEMOTE_WARNING = "Smoothness stopped — continuing without"
+
+
+async def _watchdog_tick(app: web.Application) -> None:
+    """One tick of the failure-detection watchdog. Exposed for tests.
+
+    Iterates active sessions; for each whose transcoder has BOTH
+    state == FAILED AND has_active_pipeline() == True, calls
+    set_filter_chain(NoopFilter) in the executor and queues a popup warning.
+    """
+    store: SessionStore = app["session_store"]
+    loop = asyncio.get_running_loop()
+    for sess in store.iter_active():
+        transcoder = sess.transcoder
+        if transcoder is None:
+            continue
+        try:
+            if transcoder.state != TranscoderState.FAILED:
+                continue
+            if not transcoder.has_active_pipeline():
+                continue
+        except Exception:
+            log.exception("watchdog: probing transcoder state crashed")
+            continue
+        log.warning(
+            "[watchdog token=%s] FAILED with active pipeline; demoting to Noop "
+            "(last_reload_error=%s)",
+            sess.token[:8], transcoder.last_reload_error,
+        )
+        try:
+            await loop.run_in_executor(
+                None, transcoder.set_filter_chain,
+                FilterChain([NoopFilter()]),
+            )
+        except RuntimeError:
+            log.warning(
+                "[watchdog token=%s] set_filter_chain refused (transcoder "
+                "may be torn down); skipping demote",
+                sess.token[:8],
+            )
+        except Exception:
+            log.exception(
+                "[watchdog token=%s] set_filter_chain crashed", sess.token[:8],
+            )
+        sess.pending_warnings.append(_WATCHDOG_DEMOTE_WARNING)
+
+
+async def _watchdog_loop(app: web.Application) -> None:
+    """Background coroutine: runs one tick every _WATCHDOG_INTERVAL_SECONDS
+    until cancelled by _on_cleanup."""
+    try:
+        while True:
+            await asyncio.sleep(_WATCHDOG_INTERVAL_SECONDS)
+            try:
+                await _watchdog_tick(app)
+            except Exception:
+                log.exception("watchdog tick crashed; loop continuing")
+    except asyncio.CancelledError:
+        log.info("watchdog loop cancelled")
+        raise
+
+
 def _default_handlers() -> Dict[str, NMHandler]:
     return {
         "ping": _handle_ping,
@@ -440,6 +711,10 @@ def _default_handlers() -> Dict[str, NMHandler]:
         "cast": _handle_cast,
         "media_cmd": _handle_media_cmd,
         "media_status": _handle_media_status,
+        # P3.4: Smooth-motion gate + hot-reload + session status polling.
+        "capabilities": _handle_capabilities,
+        "set_filter_chain": _handle_set_filter_chain,
+        "get_session_status": _handle_get_session_status,
     }
 
 
@@ -893,8 +1168,24 @@ async def _on_startup(app: web.Application) -> None:
             "CASTBOOSTER_PASSTHROUGH=1 — transcoder bypassed; every cast is passthrough"
         )
 
+    # P3.4: failure-detection watchdog — demote-to-NoopFilter when a
+    # multi-process slot transitions FAILED with active pipeline.
+    app["watchdog_task"] = asyncio.create_task(
+        _watchdog_loop(app), name="castbooster-watchdog",
+    )
+
 
 async def _on_cleanup(app: web.Application) -> None:
+    # P3.4: stop the watchdog before tearing down sessions / clients.
+    watchdog_task: Optional[asyncio.Task] = app.get("watchdog_task")
+    if watchdog_task is not None:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("watchdog task crashed during shutdown")
     client: Optional[ClientSession] = app.get("http_client")
     if client is not None:
         await client.close()

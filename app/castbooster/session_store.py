@@ -3,9 +3,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from castbooster.ffmpeg_probe import InputVideoInfo
     from castbooster.transcoder import Transcoder
 
 log = logging.getLogger(__name__)
@@ -23,6 +24,14 @@ class StreamSession:
     transcoder: Optional["Transcoder"] = None
     output_dir: Optional[Path] = None
     passthrough_only: bool = False
+    # P3.4: server→popup notifications queued here. Drained on every
+    # _handle_get_session_status call. List, not set, so order is preserved.
+    pending_warnings: List[str] = field(default_factory=list)
+    # P3.4: cached so _handle_set_filter_chain doesn't need to re-probe
+    # ffprobe on every popup toggle flip. Populated during the initial
+    # _handle_cast; None on passthrough-only sessions.
+    cast_uuid: Optional[str] = None
+    probed_video: Optional["InputVideoInfo"] = None
 
 
 class SessionStore:
@@ -61,6 +70,16 @@ class SessionStore:
 
     def get(self, token: str) -> Optional[StreamSession]:
         return self._by_token.get(token)
+
+    def iter_active(self) -> Iterator[StreamSession]:
+        """Yield sessions that have a live Transcoder attached.
+
+        Used by the P3.4 failure-detection watchdog to find candidates for
+        auto-demote when a multi-process slot transitions FAILED.
+        """
+        for sess in self._by_token.values():
+            if sess.transcoder is not None:
+                yield sess
 
     def prune_older_than(self, seconds: float) -> int:
         cutoff = time.time() - seconds
