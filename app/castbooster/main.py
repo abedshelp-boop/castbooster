@@ -14,6 +14,30 @@ from castbooster.log import LOG_PATH, setup_logging
 from castbooster.proxy import PROXY_PORT, start_proxy
 from castbooster.tray import run_tray
 
+# Pillar 3.5 thread 1: silent crashes need to leave evidence.
+# Module-level flag so the try/finally in main() can read the
+# reason set by the excepthooks.
+_shutdown_reason: str = "normal"
+
+
+def _install_sys_excepthook() -> None:
+    """Route uncaught main-thread exceptions through the logger before exit."""
+    log = logging.getLogger("castbooster")
+    original = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        global _shutdown_reason
+        _shutdown_reason = "exception"
+        log.error(
+            "FATAL unhandled exception in main thread",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        # Still call the original so the interpreter behaves normally
+        # (prints to stderr if attached, exits non-zero).
+        original(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
+
 
 def _another_instance_healthy() -> bool:
     """Return True if something on 127.0.0.1:PROXY_PORT answers /health 200.
@@ -36,6 +60,7 @@ def _another_instance_healthy() -> bool:
 
 def main() -> int:
     setup_logging()
+    _install_sys_excepthook()
     log = logging.getLogger("castbooster")
     log.info("starting Cast Booster v%s", __version__)
     log.info("log file: %s", LOG_PATH)
