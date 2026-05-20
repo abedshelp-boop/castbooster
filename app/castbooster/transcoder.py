@@ -851,6 +851,16 @@ class Transcoder:
         """
         return self._last_reload_error
 
+    def has_active_pipeline(self) -> bool:
+        """True iff the current filter chain has any stage with a non-None
+        pipeline_spec (i.e., RIFEFilter or any future multi-process filter).
+
+        Used by P3.4's failure-detection watchdog to decide whether a FAILED
+        slot warrants a demote-to-NoopFilter (only meaningful when a real
+        pipeline was active in the first place).
+        """
+        return _spec_from_chain(self._filter_chain) is not None
+
     # ---- P3.3: Pillar 5 watchdog metric placeholders ----
     @property
     def rife_fps_actual(self) -> Optional[float]:

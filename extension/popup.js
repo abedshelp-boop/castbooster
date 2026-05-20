@@ -7,6 +7,13 @@ const castBtn = document.getElementById('castBtn');
 const castBtnLabel = castBtn.querySelector('.cb-btn-label');
 const resultEl = document.getElementById('result');
 
+// P3.4: Smooth motion toggle DOM refs (picker + player views) + loader.
+const smoothRow = document.getElementById('smoothRow');
+const smoothRowPlayer = document.getElementById('smoothRowPlayer');
+const smoothToggle = document.getElementById('smoothToggle');
+const smoothTogglePlayer = document.getElementById('smoothTogglePlayer');
+const smoothReloadLoader = document.getElementById('smoothReloadLoader');
+
 // Custom "cast to" dropdown
 const devicesDD = document.getElementById('devicesDD');
 const devicesTrigger = document.getElementById('devicesTrigger');
@@ -80,10 +87,29 @@ function setStatus(kind, text) {
 
 function setHint(html) { hintEl.innerHTML = html || ''; }
 
+// P3.4: setResult now supports 'warn' (amber) with an auto-dismiss timer.
+// The .cb-result.warn / .ok / .err classes set display:block; the empty-kind
+// case strips them all so the element collapses (display:none from base).
+let _resultDismissTimer = null;
 function setResult(kind, text) {
+  if (_resultDismissTimer) {
+    clearTimeout(_resultDismissTimer);
+    _resultDismissTimer = null;
+  }
   resultEl.textContent = text;
-  resultEl.classList.remove('ok', 'err');
+  resultEl.classList.remove('ok', 'err', 'warn');
+  // showPlayerMode pins display:none inline; clear it so the class wins.
+  resultEl.style.display = '';
   if (kind) resultEl.classList.add(kind);
+  // Warnings + info-style messages auto-dismiss after ~6s so they don't
+  // linger in the player view forever.
+  if (kind === 'warn') {
+    _resultDismissTimer = setTimeout(() => {
+      resultEl.textContent = '';
+      resultEl.classList.remove('ok', 'err', 'warn');
+      _resultDismissTimer = null;
+    }, 6000);
+  }
 }
 
 function prettyKind(type, url) {
@@ -365,11 +391,18 @@ castBtn.addEventListener('click', async () => {
       url,
       castUuid,
       fallbackUserAgent: navigator.userAgent,
+      // P3.4: forward the popup's persisted "Smooth motion" preference.
+      // The proxy still gates on is_pro() defense-in-depth, but happy path
+      // is "popup says smooth=true; proxy builds RIFEFilter chain".
+      enable_smooth: smoothMotionPref,
     });
     if (!out || !out.ok) {
       setResult('err', 'Failed: ' + (out && out.error ? out.error : 'unknown error'));
     } else if (out.cast && out.cast.type === 'casting' && out.cast.status === 'ok') {
       setResult('ok', out.cast.detail || 'Playback started');
+      // P3.4: VFR / source-already-fast / etc → proxy returns an
+      // info_message so the user knows smoothness was silently skipped.
+      if (out.cast.info_message) setResult('warn', out.cast.info_message);
       // Background has already stashed activeCast — switch the popup into
       // player mode right away so the user doesn't have to close+reopen.
       await init();
@@ -392,6 +425,164 @@ async function sendNM(payload) {
   if (!resp) throw new Error('background worker unreachable');
   if (!resp.ok) throw new Error(resp.error || 'nm failed');
   return resp.resp;
+}
+
+// ---------------------------------------------------------------------------
+// P3.4 — "Smooth motion" toggle: capabilities probe, persistence, hot-reload
+// ---------------------------------------------------------------------------
+
+const SMOOTH_STORAGE_KEY = 'castbooster.smoothMotion';
+
+// Persisted user preference (NOT necessarily what the proxy is currently
+// running — the proxy's truth is reflected via get_session_status polling).
+let smoothMotionPref = false;
+// True once we've confirmed is_pro && vulkan_available. Without both, we
+// never show the toggle in either view.
+let smoothCapabilitiesReady = false;
+let smoothSessionPollTimer = null;
+
+function _setToggleVisualState(enabled) {
+  const v = enabled ? 'true' : 'false';
+  if (smoothToggle) smoothToggle.setAttribute('aria-checked', v);
+  if (smoothTogglePlayer) smoothTogglePlayer.setAttribute('aria-checked', v);
+}
+
+async function _persistSmoothPref(value) {
+  smoothMotionPref = !!value;
+  _setToggleVisualState(smoothMotionPref);
+  try {
+    await chrome.storage.local.set({ [SMOOTH_STORAGE_KEY]: smoothMotionPref });
+  } catch (e) {
+    console.warn('failed to persist smoothMotion pref', e);
+  }
+}
+
+async function loadSmoothPref() {
+  try {
+    const obj = await chrome.storage.local.get(SMOOTH_STORAGE_KEY);
+    smoothMotionPref = !!(obj && obj[SMOOTH_STORAGE_KEY]);
+  } catch (_) {
+    smoothMotionPref = false;
+  }
+  _setToggleVisualState(smoothMotionPref);
+}
+
+async function probeSmoothCapabilities() {
+  let caps = null;
+  try {
+    caps = await sendNM({ type: 'capabilities' });
+  } catch (_) {
+    caps = null;
+  }
+  smoothCapabilitiesReady = !!(caps && caps.is_pro && caps.vulkan_available);
+  // Hide both rows by default; the showPickerMode/showPlayerMode flow
+  // will reveal the right one if capabilities are ready.
+  if (smoothRow) smoothRow.hidden = true;
+  if (smoothRowPlayer) smoothRowPlayer.hidden = true;
+  return smoothCapabilitiesReady;
+}
+
+function _showSmoothRowFor(view) {
+  if (!smoothCapabilitiesReady) return;
+  if (view === 'picker' && smoothRow) smoothRow.hidden = false;
+  if (view === 'player' && smoothRowPlayer) smoothRowPlayer.hidden = false;
+}
+
+// Picker view toggle — just flip the persisted preference; nothing to
+// reload server-side (no cast yet).
+if (smoothToggle) {
+  smoothToggle.addEventListener('click', async () => {
+    if (smoothToggle.disabled) return;
+    await _persistSmoothPref(!smoothMotionPref);
+  });
+}
+
+// Player view toggle — same persistence, plus a hot-reload via the proxy.
+if (smoothTogglePlayer) {
+  smoothTogglePlayer.addEventListener('click', async () => {
+    if (smoothTogglePlayer.disabled) return;
+    if (!activeCast || !activeCast.token) {
+      // Shouldn't happen — guard anyway.
+      return;
+    }
+    const desired = !smoothMotionPref;
+    // Optimistic UI: show the loader, disable the toggle, but DON'T flip
+    // the visual until the proxy confirms (so a failed reload doesn't show
+    // a mid-state).
+    smoothTogglePlayer.disabled = true;
+    if (smoothToggle) smoothToggle.disabled = true;
+    if (smoothReloadLoader) smoothReloadLoader.hidden = false;
+    try {
+      const resp = await sendNM({
+        type: 'set_filter_chain',
+        token: activeCast.token,
+        enable_smooth: desired,
+      });
+      if (resp && resp.status === 'ok') {
+        await _persistSmoothPref(!!resp.enable_smooth_actual);
+        if (resp.info_message) setResult('warn', resp.info_message);
+      } else if (resp && resp.status === 'failed') {
+        // Demote: the proxy kept the old chain (or fell back). Reflect the
+        // actual state so the user sees truth, not their intent.
+        await _persistSmoothPref(!!resp.enable_smooth_actual);
+        if (resp.warning) setResult('warn', resp.warning);
+      } else {
+        setResult('warn', 'Could not change smoothness — try again');
+      }
+    } catch (e) {
+      setResult('warn', 'Reload failed: ' + String((e && e.message) || e));
+    } finally {
+      smoothTogglePlayer.disabled = false;
+      if (smoothToggle) smoothToggle.disabled = false;
+      if (smoothReloadLoader) smoothReloadLoader.hidden = true;
+    }
+  });
+}
+
+// Player-view polling: every 3s, ask the proxy for the truth (enable_smooth
+// actually running + any queued warnings from the watchdog or a failed
+// set_filter_chain). Stop when leaving player mode or popup closes.
+async function pollSessionStatusOnce() {
+  if (!activeCast || !activeCast.token) return;
+  let resp = null;
+  try {
+    resp = await sendNM({ type: 'get_session_status', token: activeCast.token });
+  } catch (_) { return; }
+  if (!resp) return;
+  if (resp.state === 'no_session') {
+    // Cast was torn down server-side; let the existing media_status loop
+    // detect that and showPickerMode. Don't touch the toggle here.
+    return;
+  }
+  const actual = !!resp.enable_smooth_actual;
+  if (actual !== smoothMotionPref) {
+    // Server's truth diverges from the popup's preference (e.g., the
+    // watchdog auto-demoted after a RIFE crash). Reflect truth.
+    await _persistSmoothPref(actual);
+  }
+  if (Array.isArray(resp.warnings) && resp.warnings.length) {
+    // Show the most recent warning; auto-dismiss handles cleanup.
+    setResult('warn', resp.warnings[resp.warnings.length - 1]);
+  }
+}
+
+function startSmoothSessionPolling() {
+  if (smoothSessionPollTimer) return;
+  if (!smoothCapabilitiesReady) return;
+  const tick = async () => {
+    await pollSessionStatusOnce();
+    smoothSessionPollTimer = setTimeout(tick, 3000);
+  };
+  // Fire immediately so the player view reflects proxy truth without
+  // waiting 3 seconds, then settle into the 3s cadence.
+  smoothSessionPollTimer = setTimeout(tick, 0);
+}
+
+function stopSmoothSessionPolling() {
+  if (smoothSessionPollTimer) {
+    clearTimeout(smoothSessionPollTimer);
+    smoothSessionPollTimer = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,12 +610,21 @@ function showPlayerMode() {
   setHint('');
   // Light up the ambient broadcast bias-light under the popup.
   document.body.classList.add('broadcasting');
+  // P3.4: reveal player toggle + start session-status polling so the popup
+  // can pick up watchdog-initiated demotes and reflect proxy truth.
+  if (smoothRow) smoothRow.hidden = true;
+  _showSmoothRowFor('player');
+  startSmoothSessionPolling();
 }
 
 function showPickerMode() {
   playerArea.hidden = true;
   document.body.classList.remove('broadcasting');
   stopPolling();
+  // P3.4: switch toggle visibility back to picker context.
+  if (smoothRowPlayer) smoothRowPlayer.hidden = true;
+  _showSmoothRowFor('picker');
+  stopSmoothSessionPolling();
 }
 
 // Map a media_status payload onto the single-stage player UI. Only the
@@ -732,6 +932,10 @@ async function initPicker() {
   }
 
   refreshActionRow();
+  // P3.4: reveal the picker smooth row if capabilities are ready. We don't
+  // route through showPickerMode here because that's the player→picker
+  // tear-down path; this is the initial picker render.
+  _showSmoothRowFor('picker');
 }
 
 async function init() {
@@ -757,6 +961,13 @@ async function init() {
     return;
   }
 
+  // P3.4: probe the proxy for Smooth-motion capabilities (is_pro +
+  // vulkan_available) and load the persisted toggle preference. Both are
+  // cheap (capabilities is an in-memory lookup; storage.get is local).
+  // showPlayerMode / showPickerMode rely on smoothCapabilitiesReady to
+  // decide whether to reveal their respective rows.
+  await Promise.all([loadSmoothPref(), probeSmoothCapabilities()]);
+
   // Check for an active cast. If one exists AND the app still has a live
   // session for it, render player controls instead of the picker.
   let stored = {};
@@ -780,6 +991,9 @@ async function init() {
   await initPicker();
 }
 
-window.addEventListener('unload', stopPolling);
+window.addEventListener('unload', () => {
+  stopPolling();
+  stopSmoothSessionPolling();
+});
 
 init();
