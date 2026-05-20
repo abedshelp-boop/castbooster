@@ -974,3 +974,102 @@ def test_parse_encoder_input_format_rejects_long_split():
     from castbooster.transcoder import _parse_encoder_input_format
     with pytest.raises(ValueError, match="unsupported encoder_input_format"):
         _parse_encoder_input_format("rawvideo:yuv420p:1920x1080:extra")
+
+
+# ---------- M-ARGV-1: _build_argv rawvideo branch ----------------------------
+
+def test_build_argv_rawvideo_branch_present(tmp_path, sw_profile):
+    """M-ARGV-1: with pipeline_spec, argv has -f rawvideo, -pix_fmt,
+    -s WxH, -r target, -i -. Plus sqrt-scaled -b:v and HLS muxer flags."""
+    from castbooster.transcoder import _build_argv
+    from castbooster.pipeline_spec import PipelineSpec
+
+    spec = PipelineSpec(
+        encoder_input_format="rawvideo:yuv420p:1920x1080",
+        target_fps=60,
+        side_task_factory=lambda ctx: None,
+    )
+    argv = _build_argv(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        hls_segment_seconds=2,
+        vf_fragment="null",
+        pipeline_spec=spec,
+        src_fps=24.0,
+    )
+
+    # rawvideo input flags
+    assert argv.count("-f") >= 1
+    f_indices = [i for i, a in enumerate(argv) if a == "-f"]
+    # First -f is "rawvideo" (input); a later -f is "hls" (output muxer)
+    assert argv[f_indices[0] + 1] == "rawvideo"
+    assert "rawvideo" in argv
+    assert "-pix_fmt" in argv
+    assert argv[argv.index("-pix_fmt") + 1] == "yuv420p"
+    assert "-s" in argv
+    assert argv[argv.index("-s") + 1] == "1920x1080"
+    # There must be two -r flags (input + output), both equal to target
+    r_indices = [i for i, a in enumerate(argv) if a == "-r"]
+    assert len(r_indices) == 2, f"expected 2 -r flags, got {len(r_indices)}: {argv}"
+    assert all(argv[i + 1] == "60" for i in r_indices)
+    # stdin input marker
+    assert "-i" in argv
+    assert argv[argv.index("-i") + 1] == "-"
+    # sqrt scaling: 24->60 ratio ~1.581 on 3M base → ~4.74M
+    assert "-b:v" in argv
+    bv = int(argv[argv.index("-b:v") + 1])
+    assert 4_700_000 < bv < 4_800_000, f"expected ~4.74M, got {bv}"
+    # libx264 from sw_profile, with its preset flags from _ENCODER_FLAGS
+    assert "-c:v" in argv
+    assert argv[argv.index("-c:v") + 1] == "libx264"
+    # HLS muxer flags preserved
+    assert "-hls_playlist_type" in argv
+    assert argv[argv.index("-hls_playlist_type") + 1] == "vod"
+    assert "-hls_list_size" in argv
+    assert argv[argv.index("-hls_list_size") + 1] == "0"
+    assert "-hls_segment_filename" in argv
+    # Output filename has the v-suffixed path
+    assert str(tmp_path / "out" / "seg_%05d.ts") in argv
+
+
+def test_build_argv_rawvideo_src_fps_none_no_scaling(tmp_path, sw_profile):
+    """M-ARGV-1: when src_fps is None (probe failed), default to target_fps
+    so the sqrt ratio is 1.0 → bitrate == base."""
+    from castbooster.transcoder import _build_argv, _BASE_BITRATE_BPS
+    from castbooster.pipeline_spec import PipelineSpec
+
+    spec = PipelineSpec(
+        encoder_input_format="rawvideo:yuv420p:1280x720",
+        target_fps=30,
+        side_task_factory=lambda ctx: None,
+    )
+    argv = _build_argv(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        hls_segment_seconds=2,
+        pipeline_spec=spec,
+        src_fps=None,
+    )
+    bv = int(argv[argv.index("-b:v") + 1])
+    assert bv == _BASE_BITRATE_BPS, f"expected exact base bitrate, got {bv}"
+
+
+def test_build_argv_single_popen_path_unchanged(tmp_path, sw_profile):
+    """Regression: pipeline_spec=None still produces today's single-Popen argv
+    (no rawvideo flags, has the upstream -i URL)."""
+    from castbooster.transcoder import _build_argv
+    argv = _build_argv(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        hls_segment_seconds=2,
+        vf_fragment="null",
+        pipeline_spec=None,
+    )
+    # No rawvideo flag set as INPUT
+    assert "rawvideo" not in argv, f"single-Popen path should not have rawvideo, got: {argv}"
+    # Upstream URL is the -i target (not '-')
+    assert "http://x/m.m3u8" in argv
+    assert argv[argv.index("-i") + 1] == "http://x/m.m3u8"
