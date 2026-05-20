@@ -369,10 +369,14 @@ async function handleCastNow(msg) {
       register: reg,
     };
   }
+  // P3.4: forward the popup's "Smooth motion" preference to the proxy so it
+  // can pick NoopFilter vs RIFEFilter via spec §4.2. Defaults to false when
+  // omitted, matching the proxy-side default.
   const cast = await sendNative({
     type: 'cast',
     token: reg.token,
     castUuid: msg.castUuid,
+    enable_smooth: !!msg.enable_smooth,
   });
   if (!cast || cast.type !== 'casting' || cast.status !== 'ok') {
     return {
