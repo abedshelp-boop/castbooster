@@ -1,3 +1,16 @@
+// Dev-time bug capture: surface uncaught popup errors in DevTools instead of
+// letting them disappear under partial render. Open DevTools via:
+// right-click extension icon -> Inspect popup.
+window.addEventListener('error', (e) => {
+  console.error('[popup uncaught error]',
+    e.message,
+    (e.filename || '?') + ':' + (e.lineno || '?') + ':' + (e.colno || '?'),
+    e.error);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('[popup unhandled rejection]', e.reason);
+});
+
 const statusEl = document.getElementById('status');
 const hintEl = document.getElementById('hint');
 const heroArea = document.getElementById('heroArea');

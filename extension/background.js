@@ -13,6 +13,20 @@
 
 import { captureCookiesFor } from './lib/cookie_capture.js';
 
+// Dev-time bug capture: surface uncaught service-worker errors. Without these,
+// MV3 worker exceptions vanish silently when the worker is restarted by Chrome.
+// Inspect via chrome://serviceworker-internals or the service worker console
+// link on chrome://extensions for Cast Booster.
+self.addEventListener('error', (e) => {
+  console.error('[bg uncaught error]',
+    e.message,
+    (e.filename || '?') + ':' + (e.lineno || '?') + ':' + (e.colno || '?'),
+    e.error);
+});
+self.addEventListener('unhandledrejection', (e) => {
+  console.error('[bg unhandled rejection]', e.reason);
+});
+
 const HOST_NAME = 'com.castbooster.host';
 
 // ---------------------------------------------------------------------------
