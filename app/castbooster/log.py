@@ -15,6 +15,22 @@ def _log_dir() -> Path:
 LOG_PATH = _log_dir() / "castbooster.log"
 
 
+class _FlushingRotatingFileHandler(RotatingFileHandler):
+    """Rotating handler that fsyncs after every record.
+
+    Trade ~5% perf for not losing the last ~64 KB on crash. Pillar 3.5
+    crash diagnostics: silent deaths must leave evidence behind.
+    """
+    def emit(self, record):
+        super().emit(record)
+        try:
+            self.flush()
+            if self.stream is not None:
+                os.fsync(self.stream.fileno())
+        except Exception:
+            pass  # logging must never raise from inside emit
+
+
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
     """Initialize the root logger.
 
@@ -37,7 +53,7 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    fh = RotatingFileHandler(
+    fh = _FlushingRotatingFileHandler(
         LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     fh.setFormatter(fmt)
