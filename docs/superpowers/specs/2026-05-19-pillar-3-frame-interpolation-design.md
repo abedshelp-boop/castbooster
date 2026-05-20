@@ -4,6 +4,17 @@
 > alternatives considered are in the brainstorm transcript, not
 > duplicated here. Source plan file:
 > `~/.claude/plans/yo-we-have-finally-serene-hopper.md`.
+>
+> **2026-05-20 amendment (during P3.2 implementation):** D7's choice
+> of `rife-anime` was empirically falsified at the gated test —
+> rife-anime v1.8 refuses custom `-n`, stderr: *"only rife-v4 model
+> support custom numframe and timestep"*. P3.2 switched the bundled
+> model to **`rife-v4.6`** (still the same upstream `20221029`
+> release zip). v4.6 supports arbitrary `-n target_count` and the
+> Flowframes community considers it superior to rife-anime even for
+> animation. P3.3 / P3.4 / P5 should treat the model variable as
+> `rife-v4.6` everywhere D7 is referenced. Full context in
+> `~/vault-global/claude-code/gotchas/decision-review-log.md` (2026-05-20).
 
 ---
 
