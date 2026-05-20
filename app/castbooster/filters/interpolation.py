@@ -41,7 +41,7 @@ class RIFEFilter:
         target_fps: int,
         width: int,
         height: int,
-        model: str = "rife-anime",
+        model: str = "rife-v4.6",
         rife_path: Optional[str] = None,
         ffmpeg_path: Optional[str] = None,
     ) -> None:
@@ -49,7 +49,15 @@ class RIFEFilter:
         self._target_fps = int(target_fps)
         self._w = int(width)
         self._h = int(height)
-        self._model = model
+        # Resolve the model to an absolute path. rife-ncnn-vulkan resolves a
+        # bare model name relative to the rife BINARY's directory, not the
+        # current working dir — so we ship models in
+        # castbooster/models/<name>/ and resolve here, not at the upstream
+        # default. A path-like model (contains a separator) is taken as-is.
+        if "/" in model or "\\" in model or Path(model).is_absolute():
+            self._model = model
+        else:
+            self._model = str((_license._BUNDLED_MODELS_DIR / model).resolve())
         self._rife_path = rife_path if rife_path is not None else _license._locate_rife()
         self._ffmpeg_path = ffmpeg_path if ffmpeg_path is not None else locate_ffmpeg()
 

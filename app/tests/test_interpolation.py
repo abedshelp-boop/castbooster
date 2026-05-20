@@ -62,6 +62,34 @@ def test_filterchain_with_rife_renders_null():
     assert chain.render("any-url") == "null"
 
 
+def test_init_resolves_bare_model_name_to_bundled_models_dir(tmp_path, monkeypatch):
+    """Bare model name like 'rife-v4.6' resolves to <models>/rife-v4.6/.
+
+    rife-ncnn-vulkan resolves bare -m names relative to the rife binary, not
+    the cwd. Our binary lives at castbooster/bin/, models at castbooster/models/,
+    so we must pre-resolve.
+    """
+    from castbooster.filters.interpolation import RIFEFilter
+    fake_models = tmp_path / "fake_models"
+    fake_models.mkdir()
+    monkeypatch.setattr("castbooster.license._BUNDLED_MODELS_DIR", fake_models)
+    rife = RIFEFilter(source_fps=24.0, target_fps=60, width=256, height=256,
+                      rife_path="/fake/rife", ffmpeg_path="/fake/ffmpeg",
+                      model="rife-v4.6")
+    assert rife._model == str((fake_models / "rife-v4.6").resolve())
+
+
+def test_init_keeps_path_like_model_as_is(tmp_path, monkeypatch):
+    """If user passes a path-like model (with a separator), use as-is."""
+    from castbooster.filters.interpolation import RIFEFilter
+    explicit = tmp_path / "custom" / "weights"
+    explicit.mkdir(parents=True)
+    rife = RIFEFilter(source_fps=24.0, target_fps=60, width=256, height=256,
+                      rife_path="/fake/rife", ffmpeg_path="/fake/ffmpeg",
+                      model=str(explicit))
+    assert rife._model == str(explicit)
+
+
 def test_init_locates_rife_and_ffmpeg_when_not_given(tmp_path, monkeypatch):
     """When rife_path/ffmpeg_path are None, RIFEFilter discovers via license + ffmpeg_probe."""
     from castbooster.filters.interpolation import RIFEFilter
@@ -218,7 +246,15 @@ def test_run_rife_argv(tmp_path, monkeypatch):
     assert "-i" in args and args[args.index("-i") + 1] == str(in_dir)
     assert "-o" in args and args[args.index("-o") + 1] == str(out_dir)
     assert "-n" in args and args[args.index("-n") + 1] == "120"
-    assert "-m" in args and args[args.index("-m") + 1] == "rife-anime"
+    # 2026-05-20: defaulted to rife-v4.6 (not rife-anime) because rife-anime
+    # rejects custom -n with "only rife-v4 model support custom numframe and
+    # timestep". Verified empirically against the bundled binary.
+    # The constructor resolves bare model names to absolute paths under
+    # castbooster/models/ because rife resolves bare names relative to its
+    # binary directory (castbooster/bin/), not where we ship them.
+    assert "-m" in args
+    model_arg = args[args.index("-m") + 1]
+    assert model_arg.endswith("rife-v4.6") and ("models" in model_arg.replace("\\", "/"))
     # No GPU flag (P3.2 — default auto; Pillar 5 introduces -g)
     assert "-g" not in args
     # No time-step flag (two-image mode only)
@@ -538,4 +574,88 @@ def test_side_task_cleanup_lag_calls(tmp_path, monkeypatch):
     # 4 in-loop calls (one per batch, with N-2 indices) + 2 finally calls
     assert cleanup_calls == [-2, -1, 0, 1, 2, 3], (
         f"unexpected cleanup sequence: {cleanup_calls}"
+    )
+
+
+# ---------- Vulkan-gated integration test ----------------------------------
+
+import os
+import subprocess as _real_sub
+
+
+@pytest.mark.skipif(
+    not os.environ.get("RUN_RIFE"),
+    reason="set RUN_RIFE=1 to run the real-rife integration test",
+)
+def test_side_task_end_to_end_24_to_60_with_real_rife(tmp_path):
+    """4s test clip @ 24fps -> side task -> BytesIO encoder gets 60fps rawvideo.
+
+    Requires:
+      - rife-ncnn-vulkan + rife-anime weights bundled
+        (run app/scripts/fetch_rife.ps1 first)
+      - Working Vulkan + a GPU
+      - ffmpeg vendored
+
+    Verifies:
+      - The real rife binary runs to completion.
+      - Output byte count is close to the 60fps * 4s expectation.
+      - No exception from _side_task.
+    """
+    from castbooster.filters.interpolation import RIFEFilter
+    from castbooster.ffmpeg_probe import locate_ffmpeg
+    from castbooster.license import _locate_rife, vulkan_available
+
+    if not vulkan_available():
+        pytest.skip("vulkan_available() returned False on this machine")
+
+    ffmpeg = locate_ffmpeg()
+    rife_bin = _locate_rife()
+
+    # Generate a 4s 64x64 24fps yuv420p MP4 test clip.
+    test_clip = tmp_path / "test_input.mp4"
+    gen = _real_sub.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi",
+         "-i", "testsrc2=size=256x256:rate=24:duration=4",
+         "-pix_fmt", "yuv420p",
+         "-c:v", "libx264",
+         "-y", str(test_clip)],
+        capture_output=True, timeout=60,
+    )
+    assert gen.returncode == 0, gen.stderr.decode("utf-8", "replace")
+    assert test_clip.exists()
+
+    encoder_stdin = io.BytesIO()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    # 2026-05-20: 64x64 caused STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on
+    # Qualcomm Adreno X1-45 with rife-v4.6's compute shader. 256x256 is the
+    # smallest size verified to survive the shader on this dev box.
+    rife = RIFEFilter(
+        source_fps=24.0, target_fps=60, width=256, height=256,
+        rife_path=rife_bin, ffmpeg_path=ffmpeg,
+    )
+    from castbooster.pipeline_spec import SideTaskContext
+    ctx = SideTaskContext(
+        input_url=str(test_clip),
+        target_fps=60,
+        encoder_stdin=encoder_stdin,
+        workdir=workdir,
+        cancel_event=threading.Event(),
+    )
+
+    rife._side_task(ctx)
+
+    # Expected: 4s * 24fps = 96 input frames = 2 input batches of 48 frames.
+    # Each input batch -> 120 output frames (60fps * 2s).
+    # Total: 240 output frames * 98304 bytes (256*256*1.5) = 23592960 bytes.
+    frame_size = 256 * 256 * 3 // 2
+    expected = frame_size * 120 * 2
+    actual = encoder_stdin.tell()
+    # Allow up to one batch of slack in case rife rounds to N-1 frames in a batch.
+    tolerance = frame_size * 120
+    assert abs(actual - expected) <= tolerance, (
+        f"expected ~{expected} bytes (240 frames), got {actual} bytes "
+        f"({actual // frame_size} frames)"
     )

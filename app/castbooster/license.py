@@ -32,6 +32,7 @@ def is_pro() -> bool:
 
 
 _BUNDLED_RIFE = Path(__file__).parent / "bin" / "rife-ncnn-vulkan.exe"
+_BUNDLED_MODELS_DIR = Path(__file__).parent / "models"
 
 
 def _locate_rife(override: Optional[str] = None) -> str:

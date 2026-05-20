@@ -1,18 +1,18 @@
 <#
 .SYNOPSIS
-  Download and extract rife-ncnn-vulkan + rife-anime weights into
+  Download and extract rife-ncnn-vulkan + rife-v4.6 weights into
   app/castbooster/{bin,models}/.
 
 .DESCRIPTION
   One-shot setup. Run once per clone. Mirrors fetch_ffmpeg.ps1 conventions:
   sha256 pinning, idempotency, finally-cleanup of temp files.
 
-  Idempotent: if rife-ncnn-vulkan.exe exists AND models/rife-anime/ is
+  Idempotent: if rife-ncnn-vulkan.exe exists AND models/rife-v4.6/ is
   non-empty, the script exits 0 without re-downloading. Use -Force to
   override.
 
   The upstream Windows zip is ~430MB (it bundles 4 models + macOS/Linux
-  artifacts). We extract only the binary and rife-anime/ to keep on-disk
+  artifacts). We extract only the binary and rife-v4.6/ to keep on-disk
   footprint small (~20-30MB after extraction).
 #>
 
@@ -28,7 +28,7 @@ $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppRoot    = Split-Path -Parent $ScriptDir
 $BinDir     = Join-Path $AppRoot "castbooster\bin"
 $ModelsDir  = Join-Path $AppRoot "castbooster\models"
-$AnimeDir   = Join-Path $ModelsDir "rife-anime"
+$ModelDir   = Join-Path $ModelsDir "rife-v4.6"
 $Archive    = Join-Path $env:TEMP "rife-ncnn-vulkan-20221029-windows.zip"
 $ExtractTo  = Join-Path $env:TEMP "rife-ncnn-vulkan-extracted"
 
@@ -47,8 +47,8 @@ function Test-RifePresent {
     # "are the bits on disk in the right shape".
     $exe = Join-Path $BinDir "rife-ncnn-vulkan.exe"
     if (-not (Test-Path $exe)) { return $false }
-    if (-not (Test-Path $AnimeDir)) { return $false }
-    $files = Get-ChildItem -Path $AnimeDir -File -ErrorAction SilentlyContinue
+    if (-not (Test-Path $ModelDir)) { return $false }
+    $files = Get-ChildItem -Path $ModelDir -File -ErrorAction SilentlyContinue
     if ($null -eq $files -or $files.Count -eq 0) { return $false }
     # Binary must be non-empty (extraction completed)
     if ((Get-Item $exe).Length -lt 1000000) { return $false }  # < 1MB = corrupt
@@ -56,7 +56,7 @@ function Test-RifePresent {
 }
 
 if ((Test-RifePresent) -and -not $Force) {
-    Write-Host "rife-ncnn-vulkan + rife-anime already present. Use -Force to re-fetch."
+    Write-Host "rife-ncnn-vulkan + rife-v4.6 already present. Use -Force to re-fetch."
     exit 0
 }
 
@@ -92,13 +92,16 @@ try {
 
     Copy-Item -Path $SrcExe.FullName -Destination $BinDir -Force
 
-    # Copy ONLY rife-anime/ (not v2.3 / v4 / v4.6 — we don't ship them).
-    $SrcAnime = Join-Path $SrcRoot "rife-anime"
-    if (-not (Test-Path $SrcAnime)) {
-        throw "rife-anime/ directory not found inside archive at $SrcAnime"
+    # Copy ONLY rife-v4.6/ (not rife-anime / v2.3 / v4 — we don't ship them).
+    # 2026-05-20: rife-anime refused custom -n in the gated test:
+    # "only rife-v4 model support custom numframe and timestep". rife-v4.6 is
+    # the v4 family's latest and supports arbitrary target_count for 24->60.
+    $SrcModel = Join-Path $SrcRoot "rife-v4.6"
+    if (-not (Test-Path $SrcModel)) {
+        throw "rife-v4.6/ directory not found inside archive at $SrcModel"
     }
-    if (Test-Path $AnimeDir) { Remove-Item $AnimeDir -Recurse -Force }
-    Copy-Item -Path $SrcAnime -Destination $ModelsDir -Recurse -Force
+    if (Test-Path $ModelDir) { Remove-Item $ModelDir -Recurse -Force }
+    Copy-Item -Path $SrcModel -Destination $ModelsDir -Recurse -Force
 
 } finally {
     Remove-Item $Archive   -Force -ErrorAction SilentlyContinue
@@ -107,7 +110,7 @@ try {
 
 # Smoke test
 if (-not (Test-RifePresent)) {
-    throw "Smoke test failed: rife-ncnn-vulkan.exe was copied but does not run, or rife-anime/ is empty."
+    throw "Smoke test failed: rife-ncnn-vulkan.exe was copied but does not run, or rife-v4.6/ is empty."
 }
-Write-Host "Installed: rife-ncnn-vulkan.exe + rife-anime/"
+Write-Host "Installed: rife-ncnn-vulkan.exe + rife-v4.6/"
 Write-Host "Done."
