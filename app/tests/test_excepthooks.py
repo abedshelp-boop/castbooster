@@ -114,3 +114,25 @@ def test_asyncio_exception_handler_logs_unhandled_coroutine_exception(caplog):
     matches = [r for r in caplog.records
                if "FATAL unhandled asyncio exception" in r.getMessage()]
     assert matches, f"expected FATAL log, got {[r.getMessage() for r in caplog.records]}"
+
+
+def test_main_logs_shutdown_reason_on_normal_exit(caplog, monkeypatch):
+    """When main() returns normally, the final log line should record reason=normal."""
+    from castbooster import main as main_module
+
+    # Stub out everything main() does after logging setup so we just
+    # exercise the try/finally boundary.
+    monkeypatch.setattr(main_module, "setup_logging", lambda: None)
+    monkeypatch.setattr(main_module, "_install_sys_excepthook", lambda: None)
+    monkeypatch.setattr(main_module, "_install_threading_excepthook", lambda: None)
+    monkeypatch.setattr(main_module, "_another_instance_healthy", lambda: True)
+    main_module._shutdown_reason = "normal"
+
+    with caplog.at_level(logging.INFO, logger="castbooster"):
+        rc = main_module.main()
+
+    assert rc == 0
+    shutdown_lines = [r for r in caplog.records
+                      if "shutdown reason=" in r.getMessage()]
+    assert shutdown_lines, "expected a shutdown reason= line at exit"
+    assert "reason=normal" in shutdown_lines[-1].getMessage()

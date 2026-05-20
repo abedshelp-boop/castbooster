@@ -95,76 +95,80 @@ def main() -> int:
     log.info("starting Cast Booster v%s", __version__)
     log.info("log file: %s", LOG_PATH)
 
-    if _another_instance_healthy():
-        log.info(
-            "another Cast Booster instance is already running on :%d — exiting",
-            PROXY_PORT,
-        )
-        return 0
-
-    # Pillar 2 — probe ffmpeg once at boot so later sub-tasks (transcoder,
-    # filter chain) can read the cached AccelProfile without re-running
-    # subprocess calls. Must NOT raise — Phase 1 passthrough cast still
-    # works without ffmpeg.
     try:
-        accel = detect_ffmpeg()
-        log.info("ffmpeg ready: %s", accel)
-    except FFmpegNotFoundError as e:
-        log.error(
-            "ffmpeg missing — Pillar 2 transcode features disabled. "
-            "Run app\\scripts\\fetch_ffmpeg.ps1 to install. detail=%s", e,
-        )
-    except FFmpegProbeError as e:
-        log.error("ffmpeg probe failed — Pillar 2 transcode disabled. detail=%s", e)
+        if _another_instance_healthy():
+            log.info(
+                "another Cast Booster instance is already running on :%d — exiting",
+                PROXY_PORT,
+            )
+            return 0
 
-    proxy = start_proxy(on_ready=lambda ip: log.info("proxy ready on LAN IP %s", ip))
-    if not proxy.wait_ready(timeout=5.0):
-        log.error(
-            "proxy failed to bind :%d within 5s — exiting (another instance?)",
-            PROXY_PORT,
-        )
-        return 1
-
-    def _shutdown() -> None:
-        # Drop the wake lock first so Windows can sleep again even if the
-        # proxy teardown below stalls for any reason.
-        wakelock.force_release_all()
-        log.info("shutting down proxy")
-        proxy.stop()
-
-    # Belt-and-suspenders cleanup paths. atexit covers normal exit;
-    # signal handlers cover Ctrl+C / taskkill /T / Ctrl+Break. Each calls
-    # force_release_all which is idempotent.
-    atexit.register(wakelock.force_release_all)
-
-    def _signal_handler(signum, _frame):  # noqa: ANN001 — signal signature
-        log.info("signal %s received — releasing wakelock and exiting", signum)
-        wakelock.force_release_all()
+        # Pillar 2 — probe ffmpeg once at boot so later sub-tasks (transcoder,
+        # filter chain) can read the cached AccelProfile without re-running
+        # subprocess calls. Must NOT raise — Phase 1 passthrough cast still
+        # works without ffmpeg.
         try:
+            accel = detect_ffmpeg()
+            log.info("ffmpeg ready: %s", accel)
+        except FFmpegNotFoundError as e:
+            log.error(
+                "ffmpeg missing — Pillar 2 transcode features disabled. "
+                "Run app\\scripts\\fetch_ffmpeg.ps1 to install. detail=%s", e,
+            )
+        except FFmpegProbeError as e:
+            log.error("ffmpeg probe failed — Pillar 2 transcode disabled. detail=%s", e)
+
+        proxy = start_proxy(on_ready=lambda ip: log.info("proxy ready on LAN IP %s", ip))
+        if not proxy.wait_ready(timeout=5.0):
+            log.error(
+                "proxy failed to bind :%d within 5s — exiting (another instance?)",
+                PROXY_PORT,
+            )
+            return 1
+
+        def _shutdown() -> None:
+            # Drop the wake lock first so Windows can sleep again even if the
+            # proxy teardown below stalls for any reason.
+            wakelock.force_release_all()
+            log.info("shutting down proxy")
             proxy.stop()
-        except Exception:
-            log.exception("proxy.stop() during signal handler failed")
-        # Re-raise as a normal exit so atexit handlers still run.
-        sys.exit(0)
 
-    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
-        sig = getattr(signal, sig_name, None)
-        if sig is None:
-            continue
+        # Belt-and-suspenders cleanup paths. atexit covers normal exit;
+        # signal handlers cover Ctrl+C / taskkill /T / Ctrl+Break. Each calls
+        # force_release_all which is idempotent.
+        atexit.register(wakelock.force_release_all)
+
+        def _signal_handler(signum, _frame):  # noqa: ANN001 — signal signature
+            log.info("signal %s received — releasing wakelock and exiting", signum)
+            wakelock.force_release_all()
+            try:
+                proxy.stop()
+            except Exception:
+                log.exception("proxy.stop() during signal handler failed")
+            # Re-raise as a normal exit so atexit handlers still run.
+            sys.exit(0)
+
+        for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, _signal_handler)
+            except (ValueError, OSError):
+                # signal.signal only works on the main thread and some signals
+                # aren't settable on every platform. Non-fatal.
+                log.debug("could not install handler for %s", sig_name, exc_info=True)
+
         try:
-            signal.signal(sig, _signal_handler)
-        except (ValueError, OSError):
-            # signal.signal only works on the main thread and some signals
-            # aren't settable on every platform. Non-fatal.
-            log.debug("could not install handler for %s", sig_name, exc_info=True)
-
-    try:
-        run_tray(on_quit=_shutdown)
-    except KeyboardInterrupt:
-        log.info("interrupted")
-        _shutdown()
-    log.info("goodbye")
-    return 0
+            run_tray(on_quit=_shutdown)
+        except KeyboardInterrupt:
+            log.info("interrupted")
+            _shutdown()
+        log.info("goodbye")
+        return 0
+    finally:
+        log.info("castbooster shutdown reason=%s", _shutdown_reason)
+        logging.shutdown()
 
 
 if __name__ == "__main__":
