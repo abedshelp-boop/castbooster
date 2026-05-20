@@ -157,13 +157,15 @@ def test_build_filter_chain_no_pro_returns_noop():
     assert msg is None
 
 
-def test_build_filter_chain_probe_failed_returns_noop():
+def test_build_filter_chain_probe_failed_returns_noop_with_info():
+    """Pillar 3.5: probe failure with smooth ON and Pro → surfaces info_message."""
+    from castbooster.proxy import _PROBE_FAILED_INFO
     with patch("castbooster.proxy.license.is_pro", return_value=True):
         chain, msg = _build_filter_chain(
             enable_smooth=True, caps=_caps_ultra_60(), video=None,
         )
     assert isinstance(chain.stages[0], NoopFilter)
-    assert msg is None
+    assert msg == _PROBE_FAILED_INFO
 
 
 def test_build_filter_chain_vfr_source_returns_noop_with_info():
@@ -659,3 +661,33 @@ def test_handle_cast_vfr_source_surfaces_info_message():
         assert "frame rate" in resp["info_message"].lower()
 
     _run(_go())
+
+
+def test_build_filter_chain_returns_probe_failure_info_when_video_is_None_and_smooth_requested():
+    """Pillar 3.5: when user toggled smooth ON but ffprobe failed,
+    surface a visible info_message instead of silently demoting."""
+    from castbooster.proxy import _PROBE_FAILED_INFO, _build_filter_chain
+    from castbooster.receiver_caps import capabilities_for_model
+
+    caps = capabilities_for_model("Chromecast HD")  # not audio-only, max_fps=60
+    chain, info = _build_filter_chain(
+        enable_smooth=True, caps=caps, video=None,
+    )
+    # Still demotes to noop (we can't run RIFE without source FPS info)
+    from castbooster.filter_chain import NoopFilter
+    assert isinstance(chain.stages[0], NoopFilter)
+    # But this time the user sees WHY
+    assert info == _PROBE_FAILED_INFO
+
+
+def test_build_filter_chain_stays_silent_when_video_None_but_smooth_off():
+    """If the user didn't ask for smooth, we shouldn't bother them with a
+    'probe failed' message — they wouldn't have gotten RIFE anyway."""
+    from castbooster.proxy import _build_filter_chain
+    from castbooster.receiver_caps import capabilities_for_model
+
+    caps = capabilities_for_model("Chromecast HD")
+    chain, info = _build_filter_chain(
+        enable_smooth=False, caps=caps, video=None,
+    )
+    assert info is None

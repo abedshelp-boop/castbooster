@@ -189,6 +189,7 @@ async def _handle_capabilities(_app: web.Application, _msg: dict) -> dict:
 
 
 _VFR_INFO = "Smoothness skipped — source frame rate not detectable"
+_PROBE_FAILED_INFO = "Smoothness skipped — couldn't analyze source video"
 
 
 def _build_filter_chain(
@@ -198,15 +199,23 @@ def _build_filter_chain(
 ) -> tuple[FilterChain, Optional[str]]:
     """Spec §4.2 decision tree.
 
-    Returns (chain, info_message_or_None). The info_message is surfaced to
-    the popup via the cast/set_filter_chain response so the user knows when
-    we silently fell back to NoopFilter despite enable_smooth=True.
+    Returns (chain, info_message_or_None). info_message surfaces to the
+    popup via the cast/set_filter_chain response so the user sees WHY
+    smoothness was skipped.
 
-    Args:
-        enable_smooth: popup toggle state.
-        caps: ReceiverCaps for the target Chromecast.
-        video: InputVideoInfo from probe_input_video, or None if probe failed.
+    Pillar 3.5: probe-failure case now reports _PROBE_FAILED_INFO instead
+    of silently demoting (was silent in P3.4).
     """
+    # User asked for smooth + has Pro + Chromecast supports video, but ffprobe
+    # couldn't tell us the source FPS. Surface that explicitly.
+    if (
+        video is None
+        and enable_smooth
+        and license.is_pro()
+        and not caps.audio_only
+    ):
+        return FilterChain([NoopFilter()]), _PROBE_FAILED_INFO
+    # Catch-all silent fallback (audio-only / toggle off / not pro / no video).
     if caps.audio_only or not enable_smooth or not license.is_pro() or video is None:
         return FilterChain([NoopFilter()]), None
     target_fps = caps.max_fps
