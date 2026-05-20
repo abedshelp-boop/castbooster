@@ -402,6 +402,48 @@ def test_side_task_broken_pipe_marks_slot_encoder_died(
         t.stop()
 
 
+# ---------- M-FAIL-4: side task returns early (no exception, no cancel) -----
+
+def test_side_task_returns_early_marks_slot_failed(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-FAIL-4: side task returns cleanly without exception while still
+    WARMING → poller catches via _check_side_task_locked → FAILED with
+    idle_reason='side_task_returned_early'."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain
+
+    encode_fake = FakeFfmpegProcess()
+    fake_popen.queue(encode_fake)
+
+    side_task = FakeSideTask(return_immediately=True)
+    rife = FakeRIFEFilter(side_task=side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        # The side task is `return_immediately=True` → it sets started_event,
+        # then returns without raising. The poller picks this up on its
+        # next tick (~50ms).
+        assert side_task.finished_event.wait(timeout=1.0)
+        assert _wait_for_state(t, TranscoderState.FAILED, timeout=2.0), \
+            f"expected FAILED, got state={t.state}"
+        assert t.idle_reason == "side_task_returned_early"
+        slot = t._current
+        assert slot is not None
+        assert slot._side_task_exception is None  # no exception captured
+    finally:
+        encode_fake.set_exit(0)
+        t.stop()
+
+
 # ---------- Cancel-event-set short-circuit -----------------------------------
 
 def test_side_task_exception_during_cancel_does_not_mark_failed(

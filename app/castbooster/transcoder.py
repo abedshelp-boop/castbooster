@@ -598,6 +598,35 @@ class _ProcessSlot:
                 return True
             return False
 
+    def _check_side_task_locked(self) -> bool:
+        """P3.3: returned-early detection.
+
+        Returns True iff slot transitioned to FAILED via the side task
+        returning cleanly while we still expected it to be running.
+
+        The wrapper handles the exception-captured case directly (it sets
+        FAILED with encoder_died / side_task_crashed). This helper catches
+        only the unusual "side task returned with no exception, no cancel,
+        we're still WARMING" case → idle_reason='side_task_returned_early'.
+
+        No-op for single-Popen slots (side_task_thread is None).
+        """
+        if self._side_task_thread is None:
+            return False
+        if self._side_task_thread.is_alive():
+            return False
+        if self._side_task_exception is not None:
+            return False           # wrapper already set FAILED
+        if self._side_cancel_event.is_set():
+            return False           # tearing down (stop() already ran)
+        with self._sub_state_lock:
+            if self._sub_state == _SlotState.WARMING:
+                self._set_sub_state_locked(
+                    _SlotState.FAILED, idle_reason="side_task_returned_early",
+                )
+                return True
+        return False
+
     def _watchdog_poller_loop(self) -> None:
         while not self._stop_requested.is_set():
             time.sleep(self._poll_interval)
@@ -606,6 +635,12 @@ class _ProcessSlot:
             if current in (
                 _SlotState.FAILED, _SlotState.TERMINATING, _SlotState.TERMINATED,
             ):
+                return
+            # P3.3: check side-task liveness BEFORE checking encoder exit.
+            # If the side task returned early, the encoder will eventually
+            # see EOF on stdin and also exit — but the right idle_reason
+            # is `side_task_returned_early`, not `subprocess_died_early`.
+            if self._check_side_task_locked():
                 return
             if self._check_process_exit_locked():
                 return
