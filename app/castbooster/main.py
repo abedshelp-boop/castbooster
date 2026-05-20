@@ -22,6 +22,8 @@ _shutdown_reason: str = "normal"
 
 def _install_sys_excepthook() -> None:
     """Route uncaught main-thread exceptions through the logger before exit."""
+    if getattr(sys.excepthook, "_castbooster_installed", False):
+        return
     log = logging.getLogger("castbooster")
     original = sys.excepthook
 
@@ -36,6 +38,7 @@ def _install_sys_excepthook() -> None:
         # (prints to stderr if attached, exits non-zero).
         original(exc_type, exc_value, exc_tb)
 
+    _hook._castbooster_installed = True  # type: ignore[attr-defined]
     sys.excepthook = _hook
 
 
