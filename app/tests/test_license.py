@@ -90,8 +90,19 @@ def _clear_vulkan_cache():
     lic.vulkan_available.cache_clear()
 
 
-def test_vulkan_available_true_on_clean_exit(tmp_path, monkeypatch):
-    """Probe returns True when rife -h exits 0 with no Vulkan errors."""
+_REAL_RIFE_HELP_STDERR = (
+    "Usage: rife-ncnn-vulkan -0 infile -1 infile1 -o outfile [options]...\n"
+    "       rife-ncnn-vulkan -i indir -o outdir [options]...\n"
+    "\n  -h                   show this help\n"
+)
+
+
+def test_vulkan_available_true_on_real_rife_help_output(tmp_path, monkeypatch):
+    """rife-ncnn-vulkan 20221029 exits 127 on -h but writes usage to stderr.
+
+    The probe must recognise that as success (Vulkan ICD loaded; help printed)
+    and ignore the non-zero exit code.
+    """
     from castbooster import license as lic
     fake = tmp_path / "rife-ncnn-vulkan.exe"
     fake.write_bytes(b"x")
@@ -99,9 +110,30 @@ def test_vulkan_available_true_on_clean_exit(tmp_path, monkeypatch):
     monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
 
     def _fake_run(args, **kw):
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            args=args, returncode=127,
+            stdout="", stderr=_REAL_RIFE_HELP_STDERR,
+        )
     monkeypatch.setattr(lic.subprocess, "run", _fake_run)
     assert lic.vulkan_available() is True
+
+
+def test_vulkan_available_false_on_silent_crash(tmp_path, monkeypatch):
+    """Subprocess returns non-zero AND produces no recognisable output -> False.
+
+    This rules out a broken-binary scenario where rife crashes silently before
+    the help string is emitted (e.g. corrupted exe).
+    """
+    from castbooster import license as lic
+    fake = tmp_path / "rife-ncnn-vulkan.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(lic, "_BUNDLED_RIFE", fake)
+    monkeypatch.delenv("CASTBOOSTER_RIFE", raising=False)
+
+    def _fake_run(args, **kw):
+        return subprocess.CompletedProcess(args=args, returncode=127, stdout="", stderr="")
+    monkeypatch.setattr(lic.subprocess, "run", _fake_run)
+    assert lic.vulkan_available() is False
 
 
 def test_vulkan_available_false_when_binary_missing(tmp_path, monkeypatch):
@@ -142,7 +174,7 @@ def test_vulkan_available_false_on_timeout(tmp_path, monkeypatch):
 
 
 def test_vulkan_available_false_on_vulkan_error_stderr(tmp_path, monkeypatch):
-    """Even returncode 0 is treated as failure if stderr mentions vulkan errors."""
+    """Help text plus Vulkan failure stderr -> False."""
     from castbooster import license as lic
     fake = tmp_path / "rife-ncnn-vulkan.exe"
     fake.write_bytes(b"x")
@@ -151,8 +183,8 @@ def test_vulkan_available_false_on_vulkan_error_stderr(tmp_path, monkeypatch):
 
     def _fake_run(args, **kw):
         return subprocess.CompletedProcess(
-            args=args, returncode=0, stdout="",
-            stderr="failed to find Vulkan device",
+            args=args, returncode=127, stdout="",
+            stderr=_REAL_RIFE_HELP_STDERR + "\nfailed to find Vulkan device\n",
         )
     monkeypatch.setattr(lic.subprocess, "run", _fake_run)
     assert lic.vulkan_available() is False
@@ -170,7 +202,9 @@ def test_vulkan_available_is_cached(tmp_path, monkeypatch):
 
     def _fake_run(args, **kw):
         calls["n"] += 1
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            args=args, returncode=127, stdout="", stderr=_REAL_RIFE_HELP_STDERR,
+        )
 
     monkeypatch.setattr(lic.subprocess, "run", _fake_run)
     assert lic.vulkan_available() is True

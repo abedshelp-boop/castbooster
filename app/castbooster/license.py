@@ -106,21 +106,25 @@ def vulkan_available() -> bool:
     except Exception:
         log.exception("vulkan_available: rife -h crashed")
         return False
-    if result.returncode != 0:
-        log.info(
-            "vulkan_available: rife -h exit=%d stderr=%r",
-            result.returncode, (result.stderr or "")[:200],
-        )
-        return False
+    # 2026-05-20 verified empirically: rife-ncnn-vulkan 20221029's `-h`
+    # exits with code 127 (not 0) AND writes the usage block to stderr.
+    # We therefore do NOT trust the return code. Instead, classify by:
+    #   1. stderr mentions Vulkan failure keywords -> False
+    #   2. output (stdout+stderr) contains rife's usage marker -> True
+    #   3. otherwise (silent crash, garbage output) -> False
     stderr_lower = (result.stderr or "").lower()
     if any(kw in stderr_lower for kw in _VULKAN_ERROR_KEYWORDS):
-        # only treat as failure if the keyword appears in an *error* context.
-        # rife's normal -h output may mention "vulkan" in flag descriptions,
-        # so we look for explicit failure phrases.
         if "failed" in stderr_lower or "error" in stderr_lower or "not found" in stderr_lower:
             log.info(
                 "vulkan_available: rife stderr signals Vulkan failure: %r",
                 (result.stderr or "")[:200],
             )
             return False
+    combined = ((result.stdout or "") + (result.stderr or "")).lower()
+    if "rife-ncnn-vulkan" not in combined and "usage:" not in combined:
+        log.info(
+            "vulkan_available: rife -h produced no recognisable output (exit=%d)",
+            result.returncode,
+        )
+        return False
     return True
