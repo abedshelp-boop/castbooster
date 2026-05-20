@@ -910,3 +910,67 @@ def test_custom_filter_chain_renders_in_argv(tmp_path, sw_profile):
     argv = t._build_argv()
     vf_idx = argv.index("-vf")
     assert argv[vf_idx + 1] == "scale=640:360"
+
+
+# ---------- P3.3: helper-function unit tests (M-ARGV-2, M-ARGV-3) ------------
+
+def test_scaled_bitrate_24_to_60_is_sqrt_scaled():
+    """M-ARGV-2: 24→60 fps with base 3M ≈ sqrt(60/24) * 3M ≈ 4.74 Mbps."""
+    from castbooster.transcoder import _scaled_bitrate, _BASE_BITRATE_BPS
+    out = _scaled_bitrate(_BASE_BITRATE_BPS, 24.0, 60)
+    # sqrt(2.5) ≈ 1.5811 → 4_743_416
+    assert 4_700_000 < out < 4_800_000
+
+
+def test_scaled_bitrate_same_fps_no_change():
+    """M-ARGV-2: src == tgt → no bitrate change."""
+    from castbooster.transcoder import _scaled_bitrate
+    assert _scaled_bitrate(3_000_000, 24.0, 24) == 3_000_000
+
+
+def test_scaled_bitrate_clamps_zero_src_fps():
+    """M-ARGV-2: src=0 (probe failed) → clamps to 1.0 so we don't div-by-zero."""
+    from castbooster.transcoder import _scaled_bitrate
+    out = _scaled_bitrate(3_000_000, 0.0, 60)
+    # max(0.0, 1.0) → 1.0 → sqrt(60) ≈ 7.746 → ~23.2M
+    assert 20_000_000 < out < 25_000_000
+
+
+def test_scaled_bitrate_24_to_30_is_sqrt_scaled():
+    """M-ARGV-2: 24→30 fps with base 3M ≈ sqrt(30/24) * 3M ≈ 3.35 Mbps."""
+    from castbooster.transcoder import _scaled_bitrate, _BASE_BITRATE_BPS
+    out = _scaled_bitrate(_BASE_BITRATE_BPS, 24.0, 30)
+    assert 3_300_000 < out < 3_400_000
+
+
+def test_parse_encoder_input_format_happy():
+    """M-ARGV-3: rawvideo:yuv420p:1920x1080 → ('yuv420p', '1920x1080')."""
+    from castbooster.transcoder import _parse_encoder_input_format
+    assert _parse_encoder_input_format("rawvideo:yuv420p:1920x1080") == ("yuv420p", "1920x1080")
+
+
+def test_parse_encoder_input_format_small_dims():
+    """M-ARGV-3: small dimensions parse identically (regression for fixture sizes)."""
+    from castbooster.transcoder import _parse_encoder_input_format
+    assert _parse_encoder_input_format("rawvideo:yuv420p:320x240") == ("yuv420p", "320x240")
+
+
+def test_parse_encoder_input_format_rejects_wrong_prefix():
+    """M-ARGV-3: only `rawvideo` prefix is supported in P3.3."""
+    from castbooster.transcoder import _parse_encoder_input_format
+    with pytest.raises(ValueError, match="unsupported encoder_input_format"):
+        _parse_encoder_input_format("yuv:foo:bar")
+
+
+def test_parse_encoder_input_format_rejects_short_split():
+    """M-ARGV-3: malformed input (missing the size segment) raises."""
+    from castbooster.transcoder import _parse_encoder_input_format
+    with pytest.raises(ValueError, match="unsupported encoder_input_format"):
+        _parse_encoder_input_format("rawvideo:yuv420p")
+
+
+def test_parse_encoder_input_format_rejects_long_split():
+    """M-ARGV-3: extra colon segments raise."""
+    from castbooster.transcoder import _parse_encoder_input_format
+    with pytest.raises(ValueError, match="unsupported encoder_input_format"):
+        _parse_encoder_input_format("rawvideo:yuv420p:1920x1080:extra")

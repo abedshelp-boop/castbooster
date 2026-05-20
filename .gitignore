@@ -34,6 +34,8 @@ htmlcov/
 
 # Per-developer Claude Code settings (permissions, etc.)
 .claude/settings.local.json
+# Ephemeral worktrees from Claude Code subagents (embedded git repos)
+.claude/worktrees/
 
 # Vendored ffmpeg (fetched by app/scripts/fetch_ffmpeg.ps1; too large for git)
 app/castbooster/bin/*.exe

@@ -25,6 +25,7 @@ WARMING in <base>/v<N+1>/ while OLD continues serving from <base>/v<N>/.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ from typing import Callable, Optional
 
 from castbooster.ffmpeg_probe import AccelProfile
 from castbooster.filter_chain import FilterChain, NoopFilter
+from castbooster.pipeline_spec import PipelineSpec
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +66,62 @@ class TranscoderState(Enum):
     FAILED = "failed"
     TERMINATING = "terminating"
     TERMINATED = "terminated"
+
+
+# P3.3 — Multi-proc helpers
+# -------------------------
+# Base video bitrate for the sqrt-scaled multi-proc encode path.
+# Matches the HW-encoder `-b:v 3M` value in _ENCODER_FLAGS (libx264 has no
+# explicit -b:v in single-proc mode; it relies on -preset). The multi-proc
+# path always sets -b:v because rife output is fed as rawvideo so the
+# encoder has no original-rate signal to defer to.
+_BASE_BITRATE_BPS = 3_000_000
+
+
+def _scaled_bitrate(base_bps: int, src_fps: float, tgt_fps: int) -> int:
+    """sqrt scaling per parent P3 spec D6: new = base * sqrt(tgt/src).
+
+    Examples (base=3_000_000):
+        24 → 60: ratio sqrt(60/24) ≈ 1.581 → ~4.74 Mbps
+        24 → 30: ratio sqrt(30/24) ≈ 1.118 → ~3.35 Mbps
+
+    Guards against div-by-zero by clamping src to >= 1.0.
+    """
+    return int(base_bps * math.sqrt(tgt_fps / max(src_fps, 1.0)))
+
+
+def _parse_encoder_input_format(spec: str) -> tuple[str, str]:
+    """``"rawvideo:yuv420p:1920x1080"`` → ``("yuv420p", "1920x1080")``.
+
+    Only the ``rawvideo:<pix_fmt>:<WxH>`` form is supported in P3.3.
+    Raises ``ValueError`` on any other shape.
+    """
+    parts = spec.split(":")
+    if len(parts) != 3 or parts[0] != "rawvideo":
+        raise ValueError(f"unsupported encoder_input_format: {spec!r}")
+    return parts[1], parts[2]
+
+
+def _spec_from_chain(chain: FilterChain) -> Optional[PipelineSpec]:
+    """Return the first non-None ``pipeline_spec()`` from the chain, or None.
+
+    Raises ``ValueError`` if more than one stage in the chain returns a
+    non-None PipelineSpec — P3.3 is YAGNI on multi-PipelineSpec chains;
+    no real filter needs that yet (P4 Anime4K is a -vf filter, not a
+    pipeline filter).
+    """
+    spec: Optional[PipelineSpec] = None
+    for stage in chain.stages:
+        s = stage.pipeline_spec()
+        if s is None:
+            continue
+        if spec is not None:
+            raise ValueError(
+                "FilterChain has more than one stage returning a "
+                "PipelineSpec — not supported in P3.3"
+            )
+        spec = s
+    return spec
 
 
 def _build_argv(

@@ -58,6 +58,16 @@ class FilterChain:
     def __init__(self, stages: Sequence[FilterStage] | None = None) -> None:
         self._stages: list[FilterStage] = list(stages) if stages else [NoopFilter()]
 
+    @property
+    def stages(self) -> tuple[FilterStage, ...]:
+        """Read-only view of the chain's stages.
+
+        Used by ``castbooster.transcoder._spec_from_chain`` (P3.3) to find
+        the first stage that wants its own process topology. Returns a
+        tuple so callers can't mutate the chain's internals.
+        """
+        return tuple(self._stages)
+
     def render(self, input_url: str) -> str:
         """Returns the full -vf fragment, never empty.
 
