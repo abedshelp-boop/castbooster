@@ -28,6 +28,26 @@ from castbooster.transcoder import Transcoder, TranscoderState
 
 log = logging.getLogger(__name__)
 
+
+def _asyncio_exception_handler(loop, context):
+    """Log unhandled asyncio coroutine exceptions before swallowing.
+
+    Pillar 3.5 thread 1: asyncio's default handler logs to its own
+    'asyncio' logger which we DON'T capture in the rotating file
+    handler. Route through 'castbooster' so it lands in castbooster.log.
+    """
+    _log = logging.getLogger("castbooster")
+    exc = context.get("exception")
+    msg = context.get("message", "unhandled asyncio context")
+    if exc is not None:
+        _log.error(
+            "FATAL unhandled asyncio exception: %s", msg,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    else:
+        _log.error("FATAL unhandled asyncio context: %s | full=%r", msg, context)
+
+
 PROXY_HOST = "0.0.0.0"
 PROXY_PORT = 38123
 
@@ -1262,6 +1282,7 @@ def start_proxy(on_ready: Optional[Callable[[str], None]] = None) -> ProxyHandle
     def _thread() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.set_exception_handler(_asyncio_exception_handler)
         handle.loop = loop
         handle._shutdown = asyncio.Event()
         handle.lan_ip = get_lan_ip()

@@ -89,3 +89,28 @@ def test_threading_excepthook_install_is_idempotent():
         )
     finally:
         threading.excepthook = original
+
+
+import asyncio
+
+
+def test_asyncio_exception_handler_logs_unhandled_coroutine_exception(caplog):
+    from castbooster.proxy import _asyncio_exception_handler
+
+    loop = asyncio.new_event_loop()
+    try:
+        try:
+            raise KeyError("synthetic coroutine crash")
+        except KeyError as exc:
+            context = {
+                "message": "unhandled coroutine exception",
+                "exception": exc,
+            }
+        with caplog.at_level(logging.ERROR, logger="castbooster"):
+            _asyncio_exception_handler(loop, context)
+    finally:
+        loop.close()
+
+    matches = [r for r in caplog.records
+               if "FATAL unhandled asyncio exception" in r.getMessage()]
+    assert matches, f"expected FATAL log, got {[r.getMessage() for r in caplog.records]}"
