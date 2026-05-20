@@ -41,3 +41,5 @@ app/castbooster/bin/*.dll
 app/castbooster/bin/*.7z
 app/castbooster/bin/*.zip
 app/castbooster/bin/LICENSE.ffmpeg.txt
+# Vendored rife-ncnn-vulkan weights (fetched by app/scripts/fetch_rife.ps1; too large for git)
+app/castbooster/models/
