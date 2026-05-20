@@ -494,6 +494,13 @@ class _ProcessSlot:
                 return
             self._set_sub_state_locked(_SlotState.TERMINATING)
         self._stop_requested.set()
+        # P3.3: signal the side task to wind down BEFORE we close the
+        # encoder's stdin from the other side. The side task's loop checks
+        # cancel_event at the top of each batch; its internal `finally`
+        # block terminates its decode subprocess. Multi-proc-only; no-op
+        # for single-Popen slots (the event exists but no thread is
+        # watching it).
+        self._side_cancel_event.set()
         self._ready_event.set()        # unblock any wait_until_ready() waiters promptly
         if self._process is not None:
             try:
@@ -513,6 +520,18 @@ class _ProcessSlot:
                     log.error("ffmpeg refused to die even after kill()")
                 except Exception:
                     log.exception("hard kill failed")
+        # P3.3: join the side task with a bounded budget. If it doesn't
+        # exit in time, log + leak as a daemon thread (process exit reaps).
+        # We can't force-kill the side task's inner subprocesses from
+        # outside the task — RIFEFilter's own `finally` handles that.
+        if self._side_task_thread is not None and self._side_task_thread.is_alive():
+            self._side_task_thread.join(timeout=drain_seconds + 2.0)
+            if self._side_task_thread.is_alive():
+                log.warning(
+                    "side task did not exit within join budget (%.1fs); "
+                    "leaking thread (process exit will reap)",
+                    drain_seconds + 2.0,
+                )
         for th in (self._stderr_thread, self._poller_thread):
             if th is not None and th.is_alive():
                 th.join(timeout=1.0)

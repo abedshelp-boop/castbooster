@@ -444,6 +444,100 @@ def test_side_task_returns_early_marks_slot_failed(
         t.stop()
 
 
+# ---------- M-STOP-1: stop() during multi-proc WARMING ----------------------
+
+def test_stop_during_multiproc_warming_terminates_cleanly(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-STOP-1: stop() while WARMING in multi-proc → TERMINATED.
+    Side task exits cleanly (cancel_event); output_dir is removed."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain
+
+    encode_fake = FakeFfmpegProcess()
+    fake_popen.queue(encode_fake)
+
+    side_task = FakeSideTask()  # blocks on cancel_event
+    rife = FakeRIFEFilter(side_task=side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+    assert side_task.started_event.wait(timeout=1.0)
+    v1 = tmp_path / "out" / "v1"
+    assert v1.exists(), "v1 should exist after WARMING"
+
+    # Schedule the fake encoder to "exit" shortly after the q\n write
+    # so the drain returns promptly.
+    def _let_drain_finish():
+        time.sleep(0.05)
+        encode_fake.set_exit(0)
+    threading.Thread(target=_let_drain_finish, daemon=True).start()
+
+    t.stop(drain_seconds=1.0)
+
+    # Final state: TERMINATED
+    assert t.state == TranscoderState.TERMINATED
+    # Side task observed the cancel and exited
+    assert side_task.finished_event.wait(timeout=2.0), \
+        "side task did not see cancel_event in time"
+    # output_dir cleaned up
+    assert not v1.exists(), f"v1 survived stop(): exists"
+
+
+# ---------- M-STOP-2: stop() during multi-proc STREAMING --------------------
+
+def test_stop_during_multiproc_streaming_terminates_cleanly(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-STOP-2: cast through WARMING → READY → STREAMING (multi-proc), then
+    stop(). Final state TERMINATED; side task observes cancel; v1/ gone."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain
+
+    encode_fake = FakeFfmpegProcess()
+    fake_popen.queue(encode_fake)
+
+    side_task = FakeSideTask()
+    rife = FakeRIFEFilter(side_task=side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+        v1 = tmp_path / "out" / "v1"
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.5)
+        _touch_segment(v1, 2)
+        assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.5)
+        # Now stop.
+        def _let_drain():
+            time.sleep(0.05)
+            encode_fake.set_exit(0)
+        threading.Thread(target=_let_drain, daemon=True).start()
+        t.stop(drain_seconds=1.0)
+        assert t.state == TranscoderState.TERMINATED
+        assert side_task.finished_event.wait(timeout=2.0)
+        assert not v1.exists()
+    except Exception:
+        encode_fake.set_exit(-9)
+        raise
+
+
 # ---------- Cancel-event-set short-circuit -----------------------------------
 
 def test_side_task_exception_during_cancel_does_not_mark_failed(
