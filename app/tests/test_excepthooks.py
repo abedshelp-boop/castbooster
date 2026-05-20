@@ -40,3 +40,52 @@ def test_sys_excepthook_install_is_idempotent():
         )
     finally:
         sys.excepthook = original
+
+
+import threading
+
+
+def test_threading_excepthook_logs_non_main_thread_exception(caplog):
+    from castbooster.main import _install_threading_excepthook
+
+    original = threading.excepthook
+    try:
+        _install_threading_excepthook()
+        # threading.ExceptHookArgs is a named tuple; build one manually
+        # so we can call the hook without spinning a real thread.
+        try:
+            raise RuntimeError("synthetic side-thread crash")
+        except RuntimeError as exc:
+            # In Python 3.14, ExceptHookArgs is a C-level structseq that
+            # only accepts a positional iterable — no keyword arguments.
+            # Field order matches __match_args__: exc_type, exc_value,
+            # exc_traceback, thread.
+            args = threading.ExceptHookArgs(
+                (type(exc), exc, exc.__traceback__, threading.current_thread())
+            )
+        with caplog.at_level(logging.ERROR, logger="castbooster"):
+            threading.excepthook(args)
+    finally:
+        threading.excepthook = original
+
+    matches = [r for r in caplog.records
+               if "FATAL unhandled exception in thread" in r.getMessage()]
+    assert matches, f"expected FATAL log, got {[r.getMessage() for r in caplog.records]}"
+    assert matches[0].exc_info[0] is RuntimeError
+
+
+def test_threading_excepthook_install_is_idempotent():
+    """Calling _install_threading_excepthook twice must not chain hooks."""
+    from castbooster.main import _install_threading_excepthook
+
+    original = threading.excepthook
+    try:
+        _install_threading_excepthook()
+        first_hook = threading.excepthook
+        _install_threading_excepthook()
+        second_hook = threading.excepthook
+        assert first_hook is second_hook, (
+            "second install must be a no-op; got a new hook object"
+        )
+    finally:
+        threading.excepthook = original

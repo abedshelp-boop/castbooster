@@ -3,6 +3,7 @@ import http.client
 import logging
 import signal
 import sys
+import threading
 
 from castbooster import __version__, wakelock
 from castbooster.ffmpeg_probe import (
@@ -42,6 +43,31 @@ def _install_sys_excepthook() -> None:
     sys.excepthook = _hook
 
 
+def _install_threading_excepthook() -> None:
+    """Route uncaught non-main-thread exceptions through the logger.
+
+    Covers the keepalive thread, transcoder side-task threads, and the
+    pychromecast listener thread — any of which could be the silent killer.
+    """
+    if getattr(threading.excepthook, "_castbooster_installed", False):
+        return
+    log = logging.getLogger("castbooster")
+    original = threading.excepthook
+
+    def _hook(args):
+        global _shutdown_reason
+        _shutdown_reason = "exception"
+        log.error(
+            "FATAL unhandled exception in thread %r",
+            args.thread.name if args.thread else "<unknown>",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+        original(args)
+
+    _hook._castbooster_installed = True  # type: ignore[attr-defined]
+    threading.excepthook = _hook
+
+
 def _another_instance_healthy() -> bool:
     """Return True if something on 127.0.0.1:PROXY_PORT answers /health 200.
 
@@ -64,6 +90,7 @@ def _another_instance_healthy() -> bool:
 def main() -> int:
     setup_logging()
     _install_sys_excepthook()
+    _install_threading_excepthook()
     log = logging.getLogger("castbooster")
     log.info("starting Cast Booster v%s", __version__)
     log.info("log file: %s", LOG_PATH)
