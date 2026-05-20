@@ -251,6 +251,7 @@ class _ProcessSlot:
         stall_timeout: float,
         poll_interval: float,
         on_sub_state_change: Callable[["_ProcessSlot", "_SlotState"], None],
+        input_url: str = "",                          # P3.3: passed to SideTaskContext
     ) -> None:
         self._output_dir = Path(output_dir)
         self._warming_timeout = warming_timeout
@@ -270,6 +271,13 @@ class _ProcessSlot:
         self._warming_started_monotonic: float = 0.0
         self._last_seg_count: int = 0
         self._last_new_seg_monotonic: float = 0.0
+
+        # P3.3 multi-proc fields. All None / unset until _spawn_pipeline runs.
+        self._input_url_for_side_task: str = input_url
+        self._side_task_thread: Optional[threading.Thread] = None
+        self._side_task_exception: Optional[BaseException] = None
+        self._side_cancel_event: threading.Event = threading.Event()
+        self._workdir: Optional[Path] = None
 
     # ---- properties ----
     @property
@@ -297,7 +305,7 @@ class _ProcessSlot:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         (self._output_dir / "master.m3u8").write_text(_MASTER_PLAYLIST, encoding="utf-8")
 
-    def start(self, argv: list[str]) -> None:
+    def start(self, argv: list[str], pipeline_spec: Optional[PipelineSpec] = None) -> None:
         # Guard: if stop() was called before start() (race during RELOADING teardown),
         # skip directory creation and process spawn entirely.  The slot is already
         # TERMINATING/TERMINATED and its output_dir was (or will be) cleaned up by stop().
@@ -311,6 +319,13 @@ class _ProcessSlot:
         if self._stop_requested.is_set():
             self._cleanup_output_dir()
             return
+        if pipeline_spec is None:
+            self._start_single_popen(argv)
+        else:
+            self._spawn_pipeline(argv, pipeline_spec)
+
+    def _start_single_popen(self, argv: list[str]) -> None:
+        """Today's behavior — one encode ffmpeg, single Popen."""
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NO_WINDOW
@@ -342,6 +357,126 @@ class _ProcessSlot:
             daemon=True,
         )
         self._stderr_thread.start()
+
+    def _spawn_pipeline(self, encoder_argv: list[str], spec: PipelineSpec) -> None:
+        """P3.3: encode ffmpeg + side task Thread (side procs live inside the side task).
+
+        Topology when active:
+            ctx.input_url
+                |
+                v
+            side_task (a Python Thread that spawns its own decode +
+                       processing subprocesses, writes rawvideo to
+                       ctx.encoder_stdin)
+                |
+                v stdin (bufsize=0, per Q1 locked decision)
+            encode ffmpeg ─stderr─> _stderr_reader_loop
+                |
+                v
+            output_dir/seg_*.ts  (existing watchdog)
+        """
+        from castbooster.pipeline_spec import SideTaskContext
+
+        self._workdir = self._output_dir / "_workdir"
+        self._workdir.mkdir(parents=True, exist_ok=True)
+
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NO_WINDOW
+        log.info("slot (multi-proc) spawning in %s; workdir=%s",
+                 self._output_dir, self._workdir)
+        log.info("encode ffmpeg argv (multi-proc): %s",
+                 " ".join(repr(a) for a in encoder_argv))
+        # Q1: bufsize=0 unbuffered. Side task writes frame-sized chunks
+        # (~3 MB at 1080p × yuv420p). Python's BufferedWriter layer adds
+        # copies with no upside for big binary writes. Windows kernel
+        # pipe buffer (~64 KB) is the natural backpressure point.
+        self._process = subprocess.Popen(
+            encoder_argv,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            bufsize=0,
+            creationflags=creationflags,
+        )
+        log.info("encode ffmpeg PID=%s started (multi-proc)",
+                 getattr(self._process, "pid", "?"))
+        self._warming_started_monotonic = time.monotonic()
+        with self._sub_state_lock:
+            self._set_sub_state_locked(_SlotState.WARMING)
+
+        assert self._process.stdin is not None
+        ctx = SideTaskContext(
+            input_url=self._input_url_for_side_task,
+            target_fps=spec.target_fps,
+            encoder_stdin=self._process.stdin,
+            workdir=self._workdir,
+            cancel_event=self._side_cancel_event,
+        )
+        self._side_task_thread = threading.Thread(
+            target=self._side_task_wrapper,
+            args=(spec.side_task_factory, ctx),
+            name=f"slot-side-task-{id(self):x}",
+            daemon=True,
+        )
+        self._side_task_thread.start()
+
+        self._poller_thread = threading.Thread(
+            target=self._watchdog_poller_loop,
+            name=f"slot-poller-{id(self):x}",
+            daemon=True,
+        )
+        self._poller_thread.start()
+
+        self._stderr_thread = threading.Thread(
+            target=self._stderr_reader_loop,
+            name=f"slot-stderr-{id(self):x}",
+            daemon=True,
+        )
+        self._stderr_thread.start()
+
+    def _side_task_wrapper(self, factory: Callable, ctx) -> None:
+        """Run the side_task_factory and translate exceptions to slot state.
+
+        Locked decisions:
+          Q2 — use the existing _sub_state_lock + _set_sub_state_locked
+               helper that stderr readers use. First-to-the-lock records
+               the idle_reason; second observes FAILED/TERMINATING and
+               short-circuits.
+          Q3 — typed idle_reason:
+               BrokenPipeError -> "encoder_died" (encode-ffmpeg closed
+                 stdin first → next write raises BP from the side task)
+               Anything else   -> "side_task_crashed"
+               cancel_event set -> exit silently (being torn down)
+        """
+        try:
+            factory(ctx)
+        except BrokenPipeError as e:
+            if ctx.cancel_event.is_set():
+                return
+            with self._sub_state_lock:
+                if self._sub_state not in (
+                    _SlotState.FAILED, _SlotState.TERMINATING, _SlotState.TERMINATED,
+                ):
+                    self._side_task_exception = e
+                    log.warning("side task BrokenPipeError → encoder_died: %s", e)
+                    self._set_sub_state_locked(
+                        _SlotState.FAILED, idle_reason="encoder_died",
+                    )
+        except BaseException as e:
+            if ctx.cancel_event.is_set():
+                return
+            with self._sub_state_lock:
+                if self._sub_state not in (
+                    _SlotState.FAILED, _SlotState.TERMINATING, _SlotState.TERMINATED,
+                ):
+                    self._side_task_exception = e
+                    log.warning(
+                        "side task crashed (%s): %s", type(e).__name__, e,
+                    )
+                    self._set_sub_state_locked(
+                        _SlotState.FAILED, idle_reason="side_task_crashed",
+                    )
 
     def wait_until_ready(self, timeout: float) -> bool:
         signalled = self._ready_event.wait(timeout=timeout)
@@ -591,6 +726,7 @@ class Transcoder:
         warming_timeout: float = 8.0,
         stall_timeout: float = 8.0,
         hls_segment_seconds: int = 2,
+        src_fps_hint: Optional[float] = None,           # P3.3 — feeds _scaled_bitrate
         _poll_interval: float = 0.25,
     ) -> None:
         if accel is None:
@@ -605,6 +741,7 @@ class Transcoder:
         self._warming_timeout = warming_timeout
         self._stall_timeout = stall_timeout
         self._hls_segment_seconds = hls_segment_seconds
+        self._src_fps_hint = src_fps_hint
         self._poll_interval = _poll_interval
 
         self._state: TranscoderState = TranscoderState.IDLE
@@ -615,6 +752,12 @@ class Transcoder:
         self._slot_counter: int = 0                    # Task 6 increments this
         self._last_reload_error: Optional[str] = None
         self._filter_chain_pending: Optional[FilterChain] = None
+
+        # P3.3: Pillar 5 watchdog reads these. P3.3 emits None placeholders;
+        # the real RIFEFilter side task in P3.2 doesn't yet wire them through.
+        self._rife_fps_actual: Optional[float] = None
+        self._rife_lag_seconds: Optional[float] = None
+        self._vulkan_device_name: Optional[str] = None
 
     # ---- public properties ----
     @property
@@ -654,6 +797,22 @@ class Transcoder:
         """
         return self._last_reload_error
 
+    # ---- P3.3: Pillar 5 watchdog metric placeholders ----
+    @property
+    def rife_fps_actual(self) -> Optional[float]:
+        """Live RIFE output framerate. P3.3 emits None; Pillar 5 wires real value."""
+        return self._rife_fps_actual
+
+    @property
+    def rife_lag_seconds(self) -> Optional[float]:
+        """Encoder wall-clock lag vs upstream. P3.3 emits None; Pillar 5 wires."""
+        return self._rife_lag_seconds
+
+    @property
+    def vulkan_device_name(self) -> Optional[str]:
+        """Picked Vulkan GPU name. P3.3 emits None; Pillar 5 wires."""
+        return self._vulkan_device_name
+
     # ---- lifecycle ----
     def start(self) -> None:
         with self._state_lock:
@@ -664,12 +823,14 @@ class Transcoder:
             self._set_state_locked(TranscoderState.SPAWNING)
             self._slot_counter = 1
         slot_dir = self._base_output_dir / f"v{self._slot_counter}"
+        pipeline_spec = _spec_from_chain(self._filter_chain)
         self._current = _ProcessSlot(
             output_dir=slot_dir,
             warming_timeout=self._warming_timeout,
             stall_timeout=self._stall_timeout,
             poll_interval=self._poll_interval,
             on_sub_state_change=self._on_current_substate_change,
+            input_url=self._input_url,
         )
         argv = _build_argv(
             input_url=self._input_url,
@@ -677,8 +838,10 @@ class Transcoder:
             accel=self._accel,
             hls_segment_seconds=self._hls_segment_seconds,
             vf_fragment=self._filter_chain.render(self._input_url),
+            pipeline_spec=pipeline_spec,
+            src_fps=self._src_fps_hint,
         )
-        self._current.start(argv)
+        self._current.start(argv, pipeline_spec=pipeline_spec)
         # _current's start() already moved sub_state to WARMING; mirror to aggregate
         with self._state_lock:
             self._set_state_locked(TranscoderState.WARMING)
