@@ -842,9 +842,16 @@ class Transcoder:
             src_fps=self._src_fps_hint,
         )
         self._current.start(argv, pipeline_spec=pipeline_spec)
-        # _current's start() already moved sub_state to WARMING; mirror to aggregate
+        # _current's start() already moved sub_state to WARMING; mirror to
+        # aggregate. P3.3 race: a multi-proc side task can fail BEFORE
+        # slot.start() returns (the wrapper Thread runs immediately and may
+        # raise on its first call). In that case the slot's callback has
+        # already set self._state to FAILED — do NOT overwrite. Only mirror
+        # if we're still in SPAWNING (the slot's WARMING callback never
+        # fired or hasn't propagated yet).
         with self._state_lock:
-            self._set_state_locked(TranscoderState.WARMING)
+            if self._state == TranscoderState.SPAWNING:
+                self._set_state_locked(TranscoderState.WARMING)
 
     def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
         if timeout is None:

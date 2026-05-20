@@ -282,3 +282,170 @@ def test_pillar5_metric_placeholders_default_to_none(tmp_path, sw_profile):
     assert t.rife_fps_actual is None
     assert t.rife_lag_seconds is None
     assert t.vulkan_device_name is None
+
+
+# ---------- M-FAIL-1: side task raises a generic exception -------------------
+
+def test_side_task_generic_exception_marks_slot_failed(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-FAIL-1: side task raises a generic Exception → slot transitions
+    to FAILED with idle_reason='side_task_crashed'. side_task_exception is
+    captured for postmortem."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain
+
+    encode_fake = FakeFfmpegProcess()
+    fake_popen.queue(encode_fake)
+
+    boom = ValueError("simulated side-task bug")
+    side_task = FakeSideTask(raise_with=boom)
+    rife = FakeRIFEFilter(side_task=side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        assert _wait_for_state(t, TranscoderState.FAILED, timeout=2.0), \
+            f"expected FAILED, got state={t.state}"
+        assert t.idle_reason == "side_task_crashed"
+        slot = t._current
+        assert slot is not None
+        assert slot._side_task_exception is boom
+    finally:
+        encode_fake.set_exit(-9)  # release the stderr reader; encoder also "died"
+        t.stop()
+
+
+# ---------- M-FAIL-2: side task raises a wrapped subprocess RuntimeError -----
+
+def test_side_task_subprocess_runtime_error_marks_slot_failed(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-FAIL-2: side task raises a RuntimeError shaped like the one
+    RIFEFilter._side_task surfaces when its inner decode/rife exits non-zero
+    (see P3.2's app/castbooster/filters/interpolation.py final block).
+    Routes to idle_reason='side_task_crashed' just like M-FAIL-1 — the
+    same exception path."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain
+
+    encode_fake = FakeFfmpegProcess()
+    fake_popen.queue(encode_fake)
+
+    boom = RuntimeError("decode ffmpeg exited 1: Connection refused")
+    side_task = FakeSideTask(raise_with=boom)
+    rife = FakeRIFEFilter(side_task=side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        assert _wait_for_state(t, TranscoderState.FAILED, timeout=2.0)
+        assert t.idle_reason == "side_task_crashed"
+        slot = t._current
+        assert slot is not None
+        assert slot._side_task_exception is boom
+        assert "decode ffmpeg exited 1" in str(slot._side_task_exception)
+    finally:
+        encode_fake.set_exit(-9)
+        t.stop()
+
+
+# ---------- M-FAIL-3: side task raises BrokenPipeError -> encoder_died -------
+
+def test_side_task_broken_pipe_marks_slot_encoder_died(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-FAIL-3: side task raises BrokenPipeError → slot FAILED with
+    idle_reason='encoder_died' (distinct from generic side_task_crashed —
+    Pillar 5 watchdog uses this signal to differentiate remediation)."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain
+
+    encode_fake = FakeFfmpegProcess()
+    fake_popen.queue(encode_fake)
+
+    bp = BrokenPipeError("encoder closed stdin")
+    side_task = FakeSideTask(raise_with=bp)
+    rife = FakeRIFEFilter(side_task=side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        assert _wait_for_state(t, TranscoderState.FAILED, timeout=2.0)
+        assert t.idle_reason == "encoder_died"
+        slot = t._current
+        assert slot is not None
+        assert slot._side_task_exception is bp
+    finally:
+        encode_fake.set_exit(-9)
+        t.stop()
+
+
+# ---------- Cancel-event-set short-circuit -----------------------------------
+
+def test_side_task_exception_during_cancel_does_not_mark_failed(
+    tmp_path, sw_profile, fake_popen,
+):
+    """Regression for the wrapper's cancel-event-set short-circuit.
+
+    If the slot is being torn down (cancel_event set) and the side task
+    happens to raise on its way out, the wrapper must NOT transition the
+    slot to FAILED — we're already TERMINATING/TERMINATED. Verified by
+    setting cancel_event before raising.
+    """
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain
+
+    encode_fake = FakeFfmpegProcess()
+    fake_popen.queue(encode_fake)
+
+    # A side_task that BLOCKS first (lets us call stop() so cancel_event is set),
+    # then on cancel_event arrival raises a "subprocess died" RuntimeError.
+    # This mimics what happens if the side task's `finally` cleanup races.
+    def _inner(ctx):
+        # Wait briefly for cancel_event so the test can call stop() first.
+        ctx.cancel_event.wait(timeout=2.0)
+        # After cancel: raise. Wrapper must short-circuit.
+        raise RuntimeError("teardown race")
+
+    side_task = FakeSideTask(inner=_inner)
+    rife = FakeRIFEFilter(side_task=side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+    assert side_task.started_event.wait(timeout=1.0)
+    # Now call stop() — cancel_event is set, side task unblocks, raises,
+    # wrapper short-circuits.
+    encode_fake.set_exit(0)
+    t.stop()
+    # Final state is TERMINATED, NOT FAILED.
+    assert t.state == TranscoderState.TERMINATED
