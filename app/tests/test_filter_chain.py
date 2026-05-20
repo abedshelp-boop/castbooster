@@ -140,3 +140,87 @@ def test_subtitle_burnin_pipeline_spec_returns_none_after_bind():
     stage = SubtitleBurnIn()
     stage._bind("/some/path.mkv")
     assert stage.pipeline_spec() is None
+
+
+# ---------- P3.3: FilterChain.stages property + _spec_from_chain -------------
+
+def test_filter_chain_stages_returns_tuple():
+    """M-CHAIN-0: stages property returns an immutable tuple view."""
+    from castbooster.filter_chain import FilterChain, NoopFilter
+    n = NoopFilter()
+    chain = FilterChain([n])
+    stages = chain.stages
+    assert isinstance(stages, tuple)
+    assert stages == (n,)
+
+
+def test_filter_chain_stages_empty_chain_has_default_noop():
+    """M-CHAIN-0: empty constructor -> tuple containing a single NoopFilter."""
+    from castbooster.filter_chain import FilterChain, NoopFilter
+    chain = FilterChain()
+    stages = chain.stages
+    assert isinstance(stages, tuple)
+    assert len(stages) == 1
+    assert isinstance(stages[0], NoopFilter)
+
+
+def test_spec_from_chain_all_none_returns_none():
+    """M-CHAIN-3: a chain of NoopFilters returns None — single-Popen path."""
+    from castbooster.transcoder import _spec_from_chain
+    from castbooster.filter_chain import FilterChain, NoopFilter
+    assert _spec_from_chain(FilterChain([NoopFilter()])) is None
+    assert _spec_from_chain(FilterChain([NoopFilter(), NoopFilter()])) is None
+    assert _spec_from_chain(FilterChain()) is None  # default NoopFilter
+
+
+def test_spec_from_chain_single_spec_returns_it():
+    """M-CHAIN-1: a chain with one PipelineSpec-returning stage returns that spec."""
+    from castbooster.transcoder import _spec_from_chain
+    from castbooster.filter_chain import FilterChain, NoopFilter
+    from castbooster.pipeline_spec import PipelineSpec
+    sentinel = PipelineSpec(
+        encoder_input_format="rawvideo:yuv420p:320x240",
+        target_fps=60,
+        side_task_factory=lambda ctx: None,
+    )
+
+    class _StageWithSpec:
+        def render(self) -> str:
+            return "null"
+
+        def pipeline_spec(self):
+            return sentinel
+
+    chain = FilterChain([NoopFilter(), _StageWithSpec()])
+    assert _spec_from_chain(chain) is sentinel
+
+
+def test_spec_from_chain_multi_spec_raises():
+    """M-CHAIN-2: a chain with two PipelineSpec-returning stages raises ValueError."""
+    from castbooster.transcoder import _spec_from_chain
+    from castbooster.filter_chain import FilterChain
+    from castbooster.pipeline_spec import PipelineSpec
+
+    def _make_spec():
+        return PipelineSpec(
+            encoder_input_format="rawvideo:yuv420p:320x240",
+            target_fps=60,
+            side_task_factory=lambda ctx: None,
+        )
+
+    class _S1:
+        def render(self) -> str:
+            return "null"
+
+        def pipeline_spec(self):
+            return _make_spec()
+
+    class _S2:
+        def render(self) -> str:
+            return "null"
+
+        def pipeline_spec(self):
+            return _make_spec()
+
+    with pytest.raises(ValueError, match="more than one"):
+        _spec_from_chain(FilterChain([_S1(), _S2()]))
