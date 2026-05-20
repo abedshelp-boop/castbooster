@@ -1073,3 +1073,30 @@ def test_build_argv_single_popen_path_unchanged(tmp_path, sw_profile):
     # Upstream URL is the -i target (not '-')
     assert "http://x/m.m3u8" in argv
     assert argv[argv.index("-i") + 1] == "http://x/m.m3u8"
+
+
+# ---------- M-FATAL-1/2/3: new RIFE/Vulkan fatal stderr patterns -------------
+
+def test_classify_stderr_matches_vulkan_unavailable():
+    """M-FATAL-1: encoder/side stderr like 'Vulkan loader not found' -> vulkan_unavailable."""
+    from castbooster.transcoder import _classify_stderr_line
+    assert _classify_stderr_line("Vulkan loader not found") == "vulkan_unavailable"
+    assert _classify_stderr_line("ERROR: vulkan-1.dll not found") == "vulkan_unavailable"
+    # Case-insensitive
+    assert _classify_stderr_line("VULKAN runtime NOT FOUND") == "vulkan_unavailable"
+
+
+def test_classify_stderr_matches_no_vulkan_gpu():
+    """M-FATAL-2: encoder/side stderr like 'failed to find any Vulkan device' -> no_vulkan_gpu."""
+    from castbooster.transcoder import _classify_stderr_line
+    assert _classify_stderr_line("failed to find any Vulkan device") == "no_vulkan_gpu"
+    assert _classify_stderr_line(
+        "rife: failed to find a Vulkan device with the required features"
+    ) == "no_vulkan_gpu"
+
+
+def test_classify_stderr_matches_rife_model_missing():
+    """M-FATAL-3: encoder/side stderr like 'model rife-anime not found' -> rife_model_missing."""
+    from castbooster.transcoder import _classify_stderr_line
+    assert _classify_stderr_line("ERROR: model rife-anime not found") == "rife_model_missing"
+    assert _classify_stderr_line("model file rife-v4.6/flownet.param not found") == "rife_model_missing"

@@ -919,6 +919,14 @@ _FATAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"Cannot initialize.*encoder", re.I), "encoder_init_failed"),
     (re.compile(r"Failed to open codec", re.I), "encoder_init_failed"),
     (re.compile(r"Stream specifier.*matches no streams", re.I), "subtitle_stream_missing"),
+    # P3.3: RIFE / Vulkan diagnostic patterns. These can surface either on
+    # the encode ffmpeg's stderr (unlikely in the multi-proc topology —
+    # rife is a SIDE process) or via a side task's RuntimeError message
+    # being logged through a future hook. Bundled here for symmetry per
+    # parent P3 spec §6 + brainstorm decision.
+    (re.compile(r"vulkan.*not.*found", re.I), "vulkan_unavailable"),
+    (re.compile(r"failed to find.*Vulkan device", re.I), "no_vulkan_gpu"),
+    (re.compile(r"model.*not.*found", re.I), "rife_model_missing"),
 ]
 
 
