@@ -1030,10 +1030,14 @@ class Transcoder:
                 stall_timeout=self._stall_timeout,
                 poll_interval=self._poll_interval,
                 on_sub_state_change=self._on_next_substate_change,
+                input_url=self._input_url,                      # P3.3: side task input
             )
             self._filter_chain_pending = chain
             self._set_state_locked(TranscoderState.RELOADING)
 
+        # P3.3: extract the NEW chain's pipeline_spec (None for single-Popen
+        # filters like NoopFilter / SubtitleBurnIn; non-None for RIFEFilter).
+        new_pipeline_spec = _spec_from_chain(chain)
         # Build argv with the new chain
         argv = _build_argv(
             input_url=self._input_url,
@@ -1041,12 +1045,14 @@ class Transcoder:
             accel=self._accel,
             hls_segment_seconds=self._hls_segment_seconds,
             vf_fragment=chain.render(self._input_url),
+            pipeline_spec=new_pipeline_spec,
+            src_fps=self._src_fps_hint,
         )
         # Capture a local reference: stop() may null self._next concurrently.
         # _ProcessSlot.start() is guarded so it won't create output_dir if the
         # slot has already been stopped.
         next_slot_local: _ProcessSlot = self._next  # type: ignore[assignment]
-        next_slot_local.start(argv)
+        next_slot_local.start(argv, pipeline_spec=new_pipeline_spec)
 
         # Block until NEW reaches READY or FAILED (or timeout).
         # Use the local reference — stop() may have set self._next to None.

@@ -538,6 +538,242 @@ def test_stop_during_multiproc_streaming_terminates_cleanly(
         raise
 
 
+# ---------- M-RELOAD-1: hot-reload Noop -> stub-RIFE (promote) --------------
+
+def test_reload_noop_to_stub_rife_promotes(tmp_path, sw_profile, fake_popen):
+    """M-RELOAD-1: Transcoder running NoopFilter (single-Popen). Call
+    set_filter_chain(FakeRIFEFilter). NEW slot uses multi-proc path
+    (spawns encode + side task Thread). After NEW reaches READY, OLD is
+    killed; promotion happens; state returns to READY/STREAMING; output_dir
+    flips to v2."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()    # OLD encode (single-Popen)
+    new_fake = FakeFfmpegProcess()    # NEW encode (multi-proc)
+    fake_popen.queue(old_fake, new_fake)
+
+    new_side_task = FakeSideTask()
+    rife = FakeRIFEFilter(side_task=new_side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([NoopFilter()]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        # OLD to STREAMING
+        v1 = tmp_path / "out" / "v1"
+        assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.5)
+        _touch_segment(v1, 2)
+        assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.5)
+
+        # Hot-reload to RIFE in a background thread (it blocks on NEW ready)
+        result_q: queue.Queue = queue.Queue()
+
+        def call_reload():
+            try:
+                r = t.set_filter_chain(FilterChain([rife]))
+                result_q.put(("ok", r))
+            except Exception as e:
+                result_q.put(("err", e))
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+
+        # Reach RELOADING
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.5)
+        # NEW side task started
+        assert new_side_task.started_event.wait(timeout=1.5)
+
+        # Make NEW ready
+        v2 = tmp_path / "out" / "v2"
+        _make_ready(v2)
+
+        # Allow OLD's drain to complete by exiting cleanly
+        old_fake.set_exit(0)
+
+        # set_filter_chain returns True; cast continues on v2
+        kind, value = result_q.get(timeout=3.0)
+        assert kind == "ok", f"set_filter_chain raised: {value}"
+        assert value is True
+        assert t.state in (TranscoderState.READY, TranscoderState.STREAMING)
+        assert t.output_dir == v2
+        assert not v1.exists()
+    finally:
+        new_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- M-RELOAD-2: hot-reload stub-RIFE -> Noop (promote) --------------
+
+def test_reload_stub_rife_to_noop_promotes(tmp_path, sw_profile, fake_popen):
+    """M-RELOAD-2: Transcoder running FakeRIFEFilter (multi-proc). Call
+    set_filter_chain(NoopFilter). NEW slot uses single-Popen path.
+    Promotion happens."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()    # OLD encode (multi-proc)
+    new_fake = FakeFfmpegProcess()    # NEW encode (single-Popen)
+    fake_popen.queue(old_fake, new_fake)
+
+    old_side_task = FakeSideTask()
+    rife = FakeRIFEFilter(side_task=old_side_task)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([rife]),
+        src_fps_hint=24.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+        assert old_side_task.started_event.wait(timeout=1.0)
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.5)
+        _touch_segment(v1, 2)
+        assert _wait_for_state(t, TranscoderState.STREAMING, timeout=1.5)
+
+        result_q: queue.Queue = queue.Queue()
+
+        def call_reload():
+            try:
+                r = t.set_filter_chain(FilterChain([NoopFilter()]))
+                result_q.put(("ok", r))
+            except Exception as e:
+                result_q.put(("err", e))
+
+        th = threading.Thread(target=call_reload, daemon=True)
+        th.start()
+        assert _wait_for_state(t, TranscoderState.RELOADING, timeout=1.5)
+
+        v2 = tmp_path / "out" / "v2"
+        _make_ready(v2)
+
+        old_fake.set_exit(0)
+
+        kind, value = result_q.get(timeout=3.0)
+        assert kind == "ok", f"set_filter_chain raised: {value}"
+        assert value is True
+        # OLD side task observed cancel during OLD's stop()
+        assert old_side_task.finished_event.wait(timeout=2.0)
+        assert t.state in (TranscoderState.READY, TranscoderState.STREAMING)
+        assert t.output_dir == v2
+        assert not v1.exists()
+    finally:
+        new_fake.set_exit(0)
+        t.stop()
+
+
+# ---------- M-RELOAD-3: demote on NEW side_task_crashed ---------------------
+
+def test_reload_demotes_on_new_side_task_crashed(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-RELOAD-3: NEW slot's side task raises a generic Exception ->
+    NEW transitions to FAILED -> set_filter_chain returns False;
+    OLD continues serving; last_reload_error == 'side_task_crashed'."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([NoopFilter()]),
+        src_fps_hint=24.0,
+        warming_timeout=2.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.5)
+
+        boom = RuntimeError("simulated rife crash")
+        bad_side_task = FakeSideTask(raise_with=boom)
+        bad_rife = FakeRIFEFilter(side_task=bad_side_task)
+
+        # set_filter_chain runs synchronously (NEW reaches FAILED quickly)
+        result = t.set_filter_chain(FilterChain([bad_rife]))
+        assert result is False
+        assert t.last_reload_error == "side_task_crashed"
+        # OLD still serving
+        assert t.output_dir == v1
+        assert t.state in (
+            TranscoderState.READY, TranscoderState.STREAMING, TranscoderState.STALLED,
+        )
+        # NEW dir cleaned up
+        assert not (tmp_path / "out" / "v2").exists()
+    finally:
+        old_fake.set_exit(0)
+        new_fake.set_exit(-9)
+        t.stop()
+
+
+# ---------- M-RELOAD-4: demote on NEW encoder_died (BrokenPipe) -------------
+
+def test_reload_demotes_on_new_encoder_died(
+    tmp_path, sw_profile, fake_popen,
+):
+    """M-RELOAD-4: NEW slot's side task raises BrokenPipeError ->
+    NEW transitions to FAILED with idle_reason='encoder_died' -> demote.
+    last_reload_error reflects 'encoder_died'."""
+    from castbooster.transcoder import Transcoder, TranscoderState
+    from castbooster.filter_chain import FilterChain, NoopFilter
+
+    old_fake = FakeFfmpegProcess()
+    new_fake = FakeFfmpegProcess()
+    fake_popen.queue(old_fake, new_fake)
+
+    t = Transcoder(
+        input_url="http://x/m.m3u8",
+        output_dir=tmp_path / "out",
+        accel=sw_profile,
+        filter_chain=FilterChain([NoopFilter()]),
+        src_fps_hint=24.0,
+        warming_timeout=2.0,
+        _poll_interval=0.05,
+    )
+    t.start()
+    try:
+        v1 = tmp_path / "out" / "v1"
+        assert _wait_for_state(t, TranscoderState.WARMING, timeout=1.0)
+        _make_ready(v1)
+        assert _wait_for_state(t, TranscoderState.READY, timeout=1.5)
+
+        bp = BrokenPipeError("encoder stdin closed during reload")
+        bad_side_task = FakeSideTask(raise_with=bp)
+        bad_rife = FakeRIFEFilter(side_task=bad_side_task)
+
+        result = t.set_filter_chain(FilterChain([bad_rife]))
+        assert result is False
+        assert t.last_reload_error == "encoder_died"
+        assert t.output_dir == v1
+        assert not (tmp_path / "out" / "v2").exists()
+    finally:
+        old_fake.set_exit(0)
+        new_fake.set_exit(-9)
+        t.stop()
+
+
 # ---------- Cancel-event-set short-circuit -----------------------------------
 
 def test_side_task_exception_during_cancel_does_not_mark_failed(
