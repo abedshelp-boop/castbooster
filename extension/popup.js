@@ -397,6 +397,8 @@ castBtn.addEventListener('click', async () => {
   if (castBtnLabel) castBtnLabel.textContent = 'Casting…'; else castBtn.textContent = 'Casting…';
   setResult('', '');
   try {
+    console.log('[castbooster][popup] sending CAST_NOW with smoothMotionPref:',
+                smoothMotionPref);
     const out = await chrome.runtime.sendMessage({
       type: 'CAST_NOW',
       tabId: currentTabId,
@@ -488,6 +490,8 @@ async function probeSmoothCapabilities() {
     caps = null;
   }
   smoothCapabilitiesReady = !!(caps && caps.is_pro && caps.vulkan_available);
+  console.log('[castbooster][popup] capabilities:', caps,
+              'smoothCapabilitiesReady:', smoothCapabilitiesReady);
   // Hide both rows by default; the showPickerMode/showPlayerMode flow
   // will reveal the right one if capabilities are ready.
   if (smoothRow) smoothRow.hidden = true;
@@ -505,7 +509,12 @@ function _showSmoothRowFor(view) {
 // reload server-side (no cast yet).
 if (smoothToggle) {
   smoothToggle.addEventListener('click', async () => {
-    if (smoothToggle.disabled) return;
+    console.log('[castbooster][popup] picker toggle clicked, was:',
+                smoothMotionPref, '→ will set:', !smoothMotionPref);
+    if (smoothToggle.disabled) {
+      console.log('[castbooster][popup] picker toggle disabled, ignoring');
+      return;
+    }
     await _persistSmoothPref(!smoothMotionPref);
   });
 }
@@ -513,7 +522,13 @@ if (smoothToggle) {
 // Player view toggle — same persistence, plus a hot-reload via the proxy.
 if (smoothTogglePlayer) {
   smoothTogglePlayer.addEventListener('click', async () => {
-    if (smoothTogglePlayer.disabled) return;
+    console.log('[castbooster][popup] player toggle clicked, was:',
+                smoothMotionPref, '→ will set:', !smoothMotionPref,
+                'activeCast token:', activeCast?.token);
+    if (smoothTogglePlayer.disabled) {
+      console.log('[castbooster][popup] player toggle disabled, ignoring');
+      return;
+    }
     if (!activeCast || !activeCast.token) {
       // Shouldn't happen — guard anyway.
       return;

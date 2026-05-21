@@ -331,6 +331,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case 'CAST_NOW': {
+      console.log('[castbooster][bg] CAST_NOW received msg.enable_smooth:',
+                  msg.enable_smooth, 'type:', typeof msg.enable_smooth);
       // Full flow: cookie capture → register_stream → cast. Runs entirely in
       // the service worker so the popup can close without aborting mid-flow.
       handleCastNow(msg).then(
@@ -386,6 +388,8 @@ async function handleCastNow(msg) {
   // P3.4: forward the popup's "Smooth motion" preference to the proxy so it
   // can pick NoopFilter vs RIFEFilter via spec §4.2. Defaults to false when
   // omitted, matching the proxy-side default.
+  console.log('[castbooster][bg] forwarding to proxy enable_smooth:',
+              !!msg.enable_smooth);
   const cast = await sendNative({
     type: 'cast',
     token: reg.token,
