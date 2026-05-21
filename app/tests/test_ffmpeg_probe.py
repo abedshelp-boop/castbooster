@@ -296,3 +296,12 @@ def test_mf_tier_warming_budget_matches_other_hw_tiers():
     budget as nvenc / qsv / amf, NOT the 12s+ SW budget."""
     from castbooster.proxy import _WARMING_TIMEOUT_BY_TIER
     assert _WARMING_TIMEOUT_BY_TIER["mf"] == 6.0
+
+
+def test_sw_tier_warming_budget_is_24s_for_cold_start_headroom():
+    """Pillar 3.5: libx264 software encoding on a cold process can take
+    >12s to produce the first segment, especially under ARM emulation.
+    Bumped to 24s as defense-in-depth so we don't fall through to
+    passthrough on every cast for machines without HW encoders."""
+    from castbooster.proxy import _WARMING_TIMEOUT_BY_TIER
+    assert _WARMING_TIMEOUT_BY_TIER["sw"] == 24.0

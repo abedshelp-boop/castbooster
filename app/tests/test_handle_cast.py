@@ -201,7 +201,7 @@ def test_cast_uses_per_tier_warming_timeout_nvidia(tmp_path):
 
 
 def test_cast_uses_per_tier_warming_timeout_sw(tmp_path):
-    """Software tier → warming_timeout=12.0."""
+    """Software tier → warming_timeout=24.0 (Pillar 3.5: bumped from 12s)."""
     async def _go():
         app = _build_test_app(tmp_path)
         from castbooster.ffmpeg_probe import AccelProfile
@@ -217,7 +217,7 @@ def test_cast_uses_per_tier_warming_timeout_sw(tmp_path):
             return _FakeTranscoder(target_state=TranscoderState.READY)
         with patch("castbooster.proxy.Transcoder", _fake_ctor):
             await _handle_cast(app, {"token": sess.token, "castUuid": cast_uuid})
-        assert constructed_kwargs[0]["warming_timeout"] == 12.0
+        assert constructed_kwargs[0]["warming_timeout"] == 24.0
     _run(_go())
 
 
