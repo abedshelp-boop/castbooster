@@ -181,11 +181,16 @@ async def _handle_capabilities(_app: web.Application, _msg: dict) -> dict:
     can run rife-ncnn-vulkan. Popup hides the toggle unless both are True.
     Both calls are cached at the module level — this handler is O(1).
     """
-    return {
+    resp = {
         "type": "capabilities",
         "is_pro": license.is_pro(),
         "vulkan_available": license.vulkan_available(),
     }
+    log.info(
+        "capabilities: is_pro=%s vulkan_available=%s",
+        resp["is_pro"], resp["vulkan_available"],
+    )
+    return resp
 
 
 _VFR_INFO = "Smoothness skipped — source frame rate not detectable"
@@ -239,6 +244,14 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
     """
     token = msg.get("token")
     cast_uuid = msg.get("castUuid")
+    # Pillar 3.5 thread 2: log raw wire value before coercion so we can
+    # tell "popup sent False" from "popup sent missing" from "popup sent True".
+    log.info(
+        "[cast token=%s] enable_smooth_raw=%r (type=%s)",
+        (token[:8] if isinstance(token, str) else "<bad>"),
+        msg.get("enable_smooth"),
+        type(msg.get("enable_smooth")).__name__,
+    )
     enable_smooth = bool(msg.get("enable_smooth", False))
     if not token or not isinstance(token, str):
         return {"type": "casting", "status": "error", "detail": "missing 'token'"}
@@ -555,6 +568,12 @@ async def _handle_set_filter_chain(app: web.Application, msg: dict) -> dict:
     """
     token = msg.get("token")
     enable_smooth = bool(msg.get("enable_smooth", False))
+    log.info(
+        "[set_filter_chain token=%s] enable_smooth_raw=%r (type=%s)",
+        str(msg.get("token", "<missing>"))[:8],
+        msg.get("enable_smooth"),
+        type(msg.get("enable_smooth")).__name__,
+    )
     if not token or not isinstance(token, str):
         return {"type": "filter_chain_set", "status": "error",
                 "detail": "missing 'token'"}

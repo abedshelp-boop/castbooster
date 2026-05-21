@@ -691,3 +691,54 @@ def test_build_filter_chain_stays_silent_when_video_None_but_smooth_off():
         enable_smooth=False, caps=caps, video=None,
     )
     assert info is None
+
+
+import logging
+
+
+def test_handle_capabilities_logs_response_for_diagnostics(caplog):
+    """Pillar 3.5 thread 2: capabilities response is now logged so we can
+    see what Abed's machine actually reports (is_pro / vulkan_available)."""
+    from castbooster.proxy import _handle_capabilities
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    try:
+        with caplog.at_level(logging.INFO, logger="castbooster"):
+            loop.run_until_complete(_handle_capabilities(None, {}))
+    finally:
+        loop.close()
+
+    matches = [r for r in caplog.records
+               if "capabilities:" in r.getMessage()
+               and "is_pro=" in r.getMessage()
+               and "vulkan_available=" in r.getMessage()]
+    assert matches, f"expected capabilities log, got {[r.getMessage() for r in caplog.records]}"
+
+
+def test_handle_cast_logs_raw_enable_smooth_value(caplog):
+    """Pillar 3.5 thread 2: log raw msg.get('enable_smooth') BEFORE
+    coercion so we see exactly what the wire delivered."""
+    from castbooster.proxy import _handle_cast
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    try:
+        with caplog.at_level(logging.INFO, logger="castbooster"):
+            try:
+                loop.run_until_complete(
+                    _handle_cast(
+                        {"session_store": None, "cast_manager": None},  # dummy app dict
+                        {"token": "abc12345xx", "castUuid": "u", "enable_smooth": True},
+                    )
+                )
+            except Exception:
+                # OK if _handle_cast raises later — we only care about the log line
+                pass
+    finally:
+        loop.close()
+
+    matches = [r for r in caplog.records
+               if "enable_smooth_raw=" in r.getMessage()]
+    assert matches, f"expected enable_smooth_raw log, got {[r.getMessage() for r in caplog.records]}"
+    assert "True" in matches[0].getMessage()
