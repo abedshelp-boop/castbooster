@@ -1,19 +1,15 @@
 """Static Chromecast receiver capability table.
 
 pychromecast exposes `cast_info.model_name` as a string. We map it to a
-frozen ReceiverCaps record describing what the device can play.
+ReceiverCaps record telling the transcoder + filter chain what the device
+can decode and display. Pillar 3 (RIFE) uses `max_fps` to pick interpolation
+target — e.g. gating 60fps output on `max_fps == 60`.
 
-Today (P2.5) this is groundwork: the transcoder doesn't consume the caps
-yet. P3 (RIFE @ 60fps) will be the first real consumer — it gates 60fps
-output on `max_fps == 60`.
-
-Conservative-fallback rule: unknown or ambiguous models get tier="unknown"
-with safe 1080p30 H.264 AAC defaults. Notable ambiguity: pychromecast
-returns model_name="Chromecast" for 1st/2nd/3rd gen indistinguishably, so
-we treat all of them as 3rd_gen_or_older (1080p30) by default. 3rd-gen
-owners with a 1080p60 TV pay a small smoothness cost — acceptable v1
-tradeoff because the alternative is misclassifying a 1st gen and breaking
-playback.
+Optimistic-default rule (Pillar 3.5, 2026-05-20): unknown or ambiguous
+models still get tier="unknown" + zeros, but the bare "Chromecast" string
+(which pychromecast returns for 1st/2nd/3rd gen indistinguishably) defaults
+to 1080p60 because 3rd gen is the modal case in 2026. Older hardware
+degrades gracefully by decoding-and-downsampling internally.
 """
 from __future__ import annotations
 
@@ -60,9 +56,16 @@ _TABLE: dict[str, ReceiverCaps] = {
     ),
     "Chromecast": ReceiverCaps(
         tier="3rd_gen_or_older",
-        max_width=1920, max_height=1080, max_fps=30,
-        supports_h265=False, supports_av1=False,
-        supports_ac3=False, supports_eac3=False,
+        # Pillar 3.5: optimistic 60fps default. 3rd-gen Chromecast (2018+)
+        # is the modal device that reports this exact model_name string and
+        # supports 1080p60. 1st/2nd-gen (2013/2015) cap at 30fps but cope
+        # with a 60fps input by decoding-and-downsampling internally.
+        # Resolution stays 1920x1080 (the 1st/2nd-gen cap is still real).
+        max_width=1920, max_height=1080, max_fps=60,
+        supports_h265=False,
+        supports_av1=False,
+        supports_ac3=False,
+        supports_eac3=False,
         audio_only=False,
     ),
     "Chromecast HD": ReceiverCaps(

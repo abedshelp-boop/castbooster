@@ -15,12 +15,15 @@ def test_chromecast_ultra_is_4k60_hdr_capable():
     assert caps.audio_only is False
 
 
-def test_plain_chromecast_is_conservative_1080p30():
-    # 1st/2nd/3rd gen Chromecasts all report model_name="Chromecast".
-    # Conservative defaults: 1080p30 H.264 AAC only.
+def test_plain_chromecast_defaults_to_optimistic_1080p60():
+    """Pillar 3.5: 1st/2nd/3rd-gen Chromecasts all report model_name='Chromecast'.
+    3rd gen (2018+) is the modal device and supports 1080p60; defaulting to
+    30 was blocking the user-stated 60fps goal. Flipped to optimistic 60
+    — old hardware degrades gracefully (decodes-and-downsamples internally).
+    Resolution stays 1080p (1st/2nd-gen cap)."""
     caps = capabilities_for_model("Chromecast")
     assert caps.tier == "3rd_gen_or_older"
-    assert (caps.max_width, caps.max_height, caps.max_fps) == (1920, 1080, 30)
+    assert (caps.max_width, caps.max_height, caps.max_fps) == (1920, 1080, 60)
     assert caps.supports_h265 is False
     assert caps.supports_ac3 is False
 

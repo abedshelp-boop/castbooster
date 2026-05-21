@@ -24,12 +24,13 @@ def test_capabilities_for_chromecast_ultra():
     assert caps.max_height == 2160
 
 
-def test_capabilities_for_plain_chromecast_conservative():
+def test_capabilities_for_plain_chromecast_optimistic():
+    # Pillar 3.5: "Chromecast" model_name now defaults to 60fps (3rd-gen modal).
     uuid = UUID("22222222-2222-2222-2222-222222222222")
     cm = _make_cm_with_info(uuid, "Chromecast")
     caps = cm.capabilities(str(uuid))
     assert caps.tier == "3rd_gen_or_older"
-    assert caps.max_fps == 30
+    assert caps.max_fps == 60
 
 
 def test_capabilities_for_unknown_uuid_returns_unknown_fallback():
