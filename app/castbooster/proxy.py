@@ -35,8 +35,18 @@ def _asyncio_exception_handler(loop, context):
     Pillar 3.5 thread 1: asyncio's default handler logs to its own
     'asyncio' logger which we DON'T capture in the rotating file
     handler. Route through 'castbooster' so it lands in castbooster.log.
+    Also flags the process-level shutdown reason so the boundary log
+    in main()'s try/finally correctly reports 'reason=exception'
+    (matches the sys/threading excepthook installers).
     """
     _log = logging.getLogger("castbooster")
+    # Lazy import — proxy.py is imported FROM main.py, so a top-level
+    # import here would create a cycle.
+    try:
+        from castbooster import main as _main
+        _main._shutdown_reason = "exception"
+    except Exception:
+        pass  # never let bookkeeping prevent the actual log line
     exc = context.get("exception")
     msg = context.get("message", "unhandled asyncio context")
     if exc is not None:

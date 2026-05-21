@@ -136,3 +136,27 @@ def test_main_logs_shutdown_reason_on_normal_exit(caplog, monkeypatch):
                       if "shutdown reason=" in r.getMessage()]
     assert shutdown_lines, "expected a shutdown reason= line at exit"
     assert "reason=normal" in shutdown_lines[-1].getMessage()
+
+
+def test_asyncio_exception_handler_sets_shutdown_reason():
+    """Pillar 3.5: asyncio crashes must also flag shutdown_reason='exception'
+    so the boundary log line in main()'s try/finally reports the right reason
+    (matches sys/threading excepthook behavior)."""
+    from castbooster.proxy import _asyncio_exception_handler
+    from castbooster import main as main_module
+
+    saved = main_module._shutdown_reason
+    main_module._shutdown_reason = "normal"
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            try:
+                raise KeyError("synthetic coroutine crash")
+            except KeyError as exc:
+                context = {"message": "synthetic", "exception": exc}
+            _asyncio_exception_handler(loop, context)
+        finally:
+            loop.close()
+        assert main_module._shutdown_reason == "exception"
+    finally:
+        main_module._shutdown_reason = saved
