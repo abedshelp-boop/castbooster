@@ -202,32 +202,47 @@ def _build_filter_chain(
     caps,
     video,
 ) -> tuple[FilterChain, Optional[str]]:
-    """Spec §4.2 decision tree.
-
-    Returns (chain, info_message_or_None). info_message surfaces to the
-    popup via the cast/set_filter_chain response so the user sees WHY
-    smoothness was skipped.
-
-    Pillar 3.5: probe-failure case now reports _PROBE_FAILED_INFO instead
-    of silently demoting (was silent in P3.4).
-    """
-    # User asked for smooth + has Pro + Chromecast supports video, but ffprobe
-    # couldn't tell us the source FPS. Surface that explicitly.
+    """Spec §4.2 decision tree. See task 7 for the probe-failure semantics."""
     if (
         video is None
         and enable_smooth
         and license.is_pro()
         and not caps.audio_only
     ):
+        log.info(
+            "_build_filter_chain: branch=probe_failed enable_smooth=%s is_pro=%s audio_only=%s",
+            enable_smooth, license.is_pro(), caps.audio_only,
+        )
         return FilterChain([NoopFilter()]), _PROBE_FAILED_INFO
-    # Catch-all silent fallback (audio-only / toggle off / not pro / no video).
-    if caps.audio_only or not enable_smooth or not license.is_pro() or video is None:
+    if caps.audio_only:
+        log.info("_build_filter_chain: branch=audio_only")
+        return FilterChain([NoopFilter()]), None
+    if not enable_smooth:
+        log.info("_build_filter_chain: branch=smooth_off")
+        return FilterChain([NoopFilter()]), None
+    if not license.is_pro():
+        log.info("_build_filter_chain: branch=not_pro")
+        return FilterChain([NoopFilter()]), None
+    if video is None:
+        log.info("_build_filter_chain: branch=no_video (smooth=%s)", enable_smooth)
         return FilterChain([NoopFilter()]), None
     target_fps = caps.max_fps
     if video.fps is None:
+        log.info(
+            "_build_filter_chain: branch=vfr target_fps=%s (source fps undetectable)",
+            target_fps,
+        )
         return FilterChain([NoopFilter()]), _VFR_INFO
     if video.fps >= target_fps:
+        log.info(
+            "_build_filter_chain: branch=source_meets_target source_fps=%s target_fps=%s",
+            video.fps, target_fps,
+        )
         return FilterChain([NoopFilter()]), None
+    log.info(
+        "_build_filter_chain: branch=rife source_fps=%s target_fps=%s %dx%d",
+        video.fps, target_fps, video.width, video.height,
+    )
     rife = RIFEFilter(
         source_fps=video.fps, target_fps=target_fps,
         width=video.width, height=video.height,

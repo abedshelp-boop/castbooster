@@ -742,3 +742,20 @@ def test_handle_cast_logs_raw_enable_smooth_value(caplog):
                if "enable_smooth_raw=" in r.getMessage()]
     assert matches, f"expected enable_smooth_raw log, got {[r.getMessage() for r in caplog.records]}"
     assert "True" in matches[0].getMessage()
+
+
+def test_build_filter_chain_logs_branch_taken_with_deciding_values(caplog):
+    """Pillar 3.5: every branch of the decision tree logs WHY it took that
+    branch so we can correlate proxy state with user-visible behavior."""
+    from castbooster.proxy import _build_filter_chain
+    from castbooster.receiver_caps import capabilities_for_model
+
+    # Cover the probe-failed branch and assert the deciding values land.
+    caps = capabilities_for_model("Chromecast HD")
+    with caplog.at_level(logging.INFO, logger="castbooster"):
+        _build_filter_chain(enable_smooth=True, caps=caps, video=None)
+
+    matches = [r for r in caplog.records
+               if "_build_filter_chain:" in r.getMessage()
+               and "branch=probe_failed" in r.getMessage()]
+    assert matches, f"expected probe_failed branch log, got {[r.getMessage() for r in caplog.records]}"
