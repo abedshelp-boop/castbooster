@@ -99,7 +99,8 @@ _WARMING_TIMEOUT_BY_TIER = {
     "nvidia": 6.0,
     "intel":  6.0,
     "amd":    6.0,
-    "sw":     12.0,
+    "mf":     6.0,    # Pillar 3.5: HW-accelerated, same budget as vendor encoders
+    "sw":     12.0,   # bumped to 24.0 in task 13
 }
 
 _PASSTHROUGH_ENV_TRUTHY = {"1", "true", "yes"}

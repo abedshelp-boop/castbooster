@@ -41,11 +41,12 @@ class AccelProfile:
 
 
 # Priority order for encoder selection. Earlier entries win when both are usable.
-_ENCODER_CANDIDATES = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
+_ENCODER_CANDIDATES = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264")
 _TIER_FOR_ENCODER = {
     "h264_nvenc": "nvidia",
     "h264_qsv": "intel",
     "h264_amf": "amd",
+    "h264_mf": "mf",        # Pillar 3.5: Media Foundation (Qualcomm Adreno on ARM Windows)
     "libx264": "sw",
 }
 # Decoder priority per tier. "none" means SW decode (always available).
@@ -61,6 +62,7 @@ _DECODER_FOR_TIER = {
     "nvidia": ("cuda", "d3d11va", "none"),
     "intel":  ("qsv",  "d3d11va", "none"),
     "amd":    ("d3d11va", "dxva2", "none"),
+    "mf":     ("none",),    # Pillar 3.5: same safe default as sw (avoid 2026-05-17 d3d11va hang)
     "sw":     ("none",),
 }
 
@@ -278,6 +280,33 @@ def try_encoder(ffmpeg_path: str, encoder: str) -> bool:
         return False
 
 
+def _list_hwaccels(ffmpeg_path: str) -> List[str]:
+    """Return the list of hwaccels reported by `ffmpeg -hwaccels`.
+
+    Extracted as a module-level function so tests can monkeypatch it.
+    """
+    hw_proc = _run([ffmpeg_path, "-hide_banner", "-hwaccels"], timeout=5.0)
+    return parse_hwaccels(hw_proc.stdout or "")
+
+
+def _list_encoders(ffmpeg_path: str) -> List[str]:
+    """Return the list of encoders reported by `ffmpeg -encoders`.
+
+    Extracted as a module-level function so tests can monkeypatch it.
+    """
+    enc_proc = _run([ffmpeg_path, "-hide_banner", "-encoders"], timeout=5.0)
+    return parse_encoders(enc_proc.stdout or "")
+
+
+def _runtime_probe_encoder(enc: str, ffmpeg_path: str) -> bool:
+    """Run the runtime probe for a single encoder.
+
+    Thin wrapper around try_encoder extracted as a module-level function
+    so tests can monkeypatch it without touching try_encoder.
+    """
+    return try_encoder(ffmpeg_path, enc)
+
+
 def _pick_decoder(tier: str, available_hwaccels: List[str]) -> str:
     """Pick the best decoder for the given tier, prefer matched HW decode."""
     for candidate in _DECODER_FOR_TIER[tier]:
@@ -321,16 +350,14 @@ def detect(ffmpeg_path_override: Optional[str] = None) -> AccelProfile:
     ffmpeg_path = locate_ffmpeg(ffmpeg_path_override)
     version = _ffmpeg_version(ffmpeg_path)
 
-    hw_proc  = _run([ffmpeg_path, "-hide_banner", "-hwaccels"], timeout=5.0)
-    enc_proc = _run([ffmpeg_path, "-hide_banner", "-encoders"], timeout=5.0)
-    hwaccels = parse_hwaccels(hw_proc.stdout or "")
-    encoders = parse_encoders(enc_proc.stdout or "")
+    hwaccels = _list_hwaccels(ffmpeg_path)
+    encoders = _list_encoders(ffmpeg_path)
 
     chosen: Optional[str] = None
     for cand in _ENCODER_CANDIDATES:
         if cand not in encoders:
             continue
-        if try_encoder(ffmpeg_path, cand):
+        if _runtime_probe_encoder(cand, ffmpeg_path):
             chosen = cand
             break
     if chosen is None:

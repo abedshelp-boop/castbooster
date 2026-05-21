@@ -252,3 +252,47 @@ def test_detect_caches_result(monkeypatch, tmp_path):
     after_first = call_count["n"]
     ffmpeg_probe.detect()
     assert call_count["n"] == after_first, "detect() should be cached"
+
+
+def test_encoder_priority_picks_h264_mf_when_no_vendor_hw_available(monkeypatch):
+    """Pillar 3.5 thread 3: Snapdragon X / ARM Windows machines expose
+    h264_mf (Media Foundation) but no nvenc / qsv / amf. Probe should
+    pick h264_mf in preference to falling back to libx264 software."""
+    from castbooster import ffmpeg_probe
+
+    # Stub the encoder list parse to return only h264_mf + libx264 — what
+    # an ARM Windows machine reports.
+    monkeypatch.setattr(
+        ffmpeg_probe, "_list_encoders",
+        lambda *_a, **_kw: ["h264_mf", "libx264"],
+    )
+    # All runtime probes succeed (no real encoder runs in this unit test).
+    monkeypatch.setattr(
+        ffmpeg_probe, "_runtime_probe_encoder",
+        lambda enc, *_a, **_kw: True,
+    )
+    monkeypatch.setattr(
+        ffmpeg_probe, "_list_hwaccels", lambda *_a, **_kw: ["d3d11va"],
+    )
+    monkeypatch.setattr(
+        ffmpeg_probe, "locate_ffmpeg", lambda *_a, **_kw: "fake_ffmpeg.exe",
+    )
+
+    profile = ffmpeg_probe.detect.__wrapped__()  # bypass lru_cache
+    assert profile.encoder == "h264_mf"
+    assert profile.tier == "mf"
+
+
+def test_mf_tier_pairs_with_decoder_none():
+    """h264_mf should pair with decoder='none' (matching the SW tier's
+    safe default) to avoid the d3d11va early-hang issue documented in
+    the 2026-05-17 sw-tier amendment."""
+    from castbooster import ffmpeg_probe
+    assert ffmpeg_probe._DECODER_FOR_TIER["mf"] == ("none",)
+
+
+def test_mf_tier_warming_budget_matches_other_hw_tiers():
+    """h264_mf is hardware-accelerated, should get the same 6s warming
+    budget as nvenc / qsv / amf, NOT the 12s+ SW budget."""
+    from castbooster.proxy import _WARMING_TIMEOUT_BY_TIER
+    assert _WARMING_TIMEOUT_BY_TIER["mf"] == 6.0
