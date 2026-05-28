@@ -642,7 +642,7 @@ function _updateCloudCard(state, warmingS, error) {
       cloudStatusError.hidden = false;
       if (state === 'config_error') {
         cloudStatusError.textContent = error
-          || 'Set RUNPOD_API_KEY + CASTBOOSTER_CLOUD_TEMPLATE_ID in env to enable cloud cast.';
+          || 'Set CLOUD_API_KEY + RUNPOD_API_KEY in env to enable cloud cast.';
       } else {
         cloudStatusError.textContent = error || baseLabel;
       }
