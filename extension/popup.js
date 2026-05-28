@@ -27,6 +27,17 @@ const smoothToggle = document.getElementById('smoothToggle');
 const smoothTogglePlayer = document.getElementById('smoothTogglePlayer');
 const smoothReloadLoader = document.getElementById('smoothReloadLoader');
 
+// P3.6: Cloud-warmup status card DOM refs (player view only).
+const cloudStatusCard = document.getElementById('cloudStatusCard');
+const cloudStatusText = document.getElementById('cloudStatusText');
+const cloudStatusElapsed = document.getElementById('cloudStatusElapsed');
+const cloudStatusFill = document.getElementById('cloudStatusFill');
+const cloudStatusError = document.getElementById('cloudStatusError');
+// Once cloud_state flips to 'streaming', we want to snap the fill to 100%
+// briefly then hide the whole card. Track the timer so repeated 'streaming'
+// snapshots don't queue redundant hides.
+let _cloudHideTimer = null;
+
 // Custom "cast to" dropdown
 const devicesDD = document.getElementById('devicesDD');
 const devicesTrigger = document.getElementById('devicesTrigger');
@@ -567,6 +578,109 @@ if (smoothTogglePlayer) {
   });
 }
 
+// P3.6: Map cloud_state / cloud_warming_s / cloud_error onto the
+// cloud-warmup status card. Idempotent — called every 3s with the latest
+// snapshot from get_session_status (Task 18).
+//
+// State table (matches docs/superpowers/specs/.../2026-05-28-...amendments §"Task 20"):
+//   ''                  → hidden (not in cloud mode)
+//   'calling_cloud'     → "Reserving GPU…"            ~15% bar
+//   'booting'           → "Booting cloud worker…"     ~35% bar
+//   'waiting_playlist'  → "Compiling engine + first frames…" ~70% bar
+//   'streaming'         → "Streaming smooth to TV"    100% bar, auto-hide 2s
+//   'failed'            → "Cloud cast failed: <err>"  red, no bar
+//   'config_error'      → "Cloud not configured" + hint  red, no bar
+// Unknown states fall through to a generic "Warming up cloud GPU…" label
+// with a time-based fill (warming_s / 90s, capped at 95%).
+const _CLOUD_LABELS = {
+  'calling_cloud': 'Reserving GPU…',
+  'booting': 'Booting cloud worker…',
+  'waiting_playlist': 'Compiling engine + first frames…',
+  'streaming': 'Streaming smooth to TV',
+  'failed': 'Cloud cast failed',
+  'config_error': 'Cloud not configured',
+};
+const _CLOUD_PROGRESS = {
+  'calling_cloud': 0.15,
+  'booting': 0.35,
+  'waiting_playlist': 0.70,
+  'streaming': 1.0,
+};
+
+function _updateCloudCard(state, warmingS, error) {
+  if (!cloudStatusCard || !cloudStatusText || !cloudStatusFill) {
+    // Older popup.html builds without the card; nothing to do.
+    return;
+  }
+
+  // Empty state → hide and reset.
+  if (!state) {
+    cloudStatusCard.hidden = true;
+    cloudStatusCard.querySelector('.cb-cloud-card')?.classList.remove('is-error');
+    if (_cloudHideTimer) {
+      clearTimeout(_cloudHideTimer);
+      _cloudHideTimer = null;
+    }
+    return;
+  }
+
+  const isError = state === 'failed' || state === 'config_error';
+  const baseLabel = _CLOUD_LABELS[state] || `Warming up cloud GPU… (${state})`;
+  const inner = cloudStatusCard.querySelector('.cb-cloud-card');
+
+  // Surface the card and update text + elapsed counter.
+  cloudStatusCard.hidden = false;
+  cloudStatusText.textContent = baseLabel;
+  if (cloudStatusElapsed) {
+    cloudStatusElapsed.textContent = `${Math.round(warmingS || 0)}s`;
+  }
+
+  // Error styling (red variant) + error detail line.
+  if (inner) inner.classList.toggle('is-error', isError);
+  if (cloudStatusError) {
+    if (isError) {
+      cloudStatusError.hidden = false;
+      if (state === 'config_error') {
+        cloudStatusError.textContent = error
+          || 'Set RUNPOD_API_KEY + CASTBOOSTER_CLOUD_TEMPLATE_ID in env to enable cloud cast.';
+      } else {
+        cloudStatusError.textContent = error || baseLabel;
+      }
+    } else {
+      cloudStatusError.hidden = true;
+      cloudStatusError.textContent = '';
+    }
+  }
+
+  // Bar width: prefer the lookup table; fall back to time-based (capped 95%)
+  // so unknown future states still show progress instead of stalling at 0%.
+  if (isError) {
+    cloudStatusFill.style.width = '0%';
+  } else if (_CLOUD_PROGRESS[state] !== undefined) {
+    cloudStatusFill.style.width = `${_CLOUD_PROGRESS[state] * 100}%`;
+  } else {
+    const pct = Math.min(95, ((warmingS || 0) / 90.0) * 100);
+    cloudStatusFill.style.width = `${pct}%`;
+  }
+
+  // On streaming, snap to 100% briefly then hide so the user sees the
+  // success transition. Don't queue duplicate hides if the state stays
+  // 'streaming' across multiple polls.
+  if (state === 'streaming') {
+    if (!_cloudHideTimer) {
+      _cloudHideTimer = setTimeout(() => {
+        cloudStatusCard.hidden = true;
+        _cloudHideTimer = null;
+      }, 2000);
+    }
+  } else if (_cloudHideTimer) {
+    // State left 'streaming' (rare — e.g. orchestrator re-enters waiting);
+    // cancel the pending hide.
+    clearTimeout(_cloudHideTimer);
+    _cloudHideTimer = null;
+  }
+}
+
 // Player-view polling: every 3s, ask the proxy for the truth (enable_smooth
 // actually running + any queued warnings from the watchdog or a failed
 // set_filter_chain). Stop when leaving player mode or popup closes.
@@ -588,6 +702,12 @@ async function pollSessionStatusOnce() {
     // watchdog auto-demoted after a RIFE crash). Reflect truth.
     await _persistSmoothPref(actual);
   }
+  // P3.6: surface cloud-warmup state into the cloud-status card.
+  _updateCloudCard(
+    resp.cloud_state || '',
+    resp.cloud_warming_s || 0,
+    resp.cloud_error || '',
+  );
   if (Array.isArray(resp.warnings) && resp.warnings.length) {
     // Show the most recent warning; auto-dismiss handles cleanup.
     setResult('warn', resp.warnings[resp.warnings.length - 1]);
@@ -653,6 +773,8 @@ function showPickerMode() {
   if (smoothRowPlayer) smoothRowPlayer.hidden = true;
   _showSmoothRowFor('picker');
   stopSmoothSessionPolling();
+  // P3.6: ensure the cloud-warmup card is hidden + reset across cast cycles.
+  _updateCloudCard('', 0, '');
 }
 
 // Map a media_status payload onto the single-stage player UI. Only the

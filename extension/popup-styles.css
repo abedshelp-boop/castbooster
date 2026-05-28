@@ -813,3 +813,96 @@
   color: rgba(111,176,255,0.6);
 }
 
+/* =================================================================
+   P3.6 — Cloud-warmup status card (player view)
+   Surfaces cloud_state / cloud_warming_s / cloud_error from
+   get_session_status. Visual language matches cb-smooth-wrap above.
+   ================================================================= */
+
+.cb-cloud-wrap {
+  padding: 6px 16px 0;
+}
+
+.cb-cloud-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 181, 71, 0.30);
+  background: rgba(255, 181, 71, 0.07);
+  font-size: 12px;
+  color: var(--cb-text);
+}
+
+.cb-cloud-card.is-error {
+  border-color: rgba(255, 120, 90, 0.38);
+  background: rgba(255, 120, 90, 0.08);
+}
+
+.cb-cloud-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.cb-cloud-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--cb-amber);
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cb-cloud-card.is-error .cb-cloud-text {
+  color: #ffd0c2;
+}
+
+.cb-cloud-elapsed {
+  flex-shrink: 0;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--cb-text-mute);
+  letter-spacing: 0.02em;
+}
+
+.cb-cloud-rail {
+  margin-top: 8px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(120, 170, 255, 0.10);
+  overflow: hidden;
+}
+
+.cb-cloud-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--cb-amber) 0%, #ffd98a 100%);
+  box-shadow: 0 0 8px rgba(255, 181, 71, 0.45);
+  transition: width 500ms cubic-bezier(0.2, 0.7, 0.2, 1),
+              background 200ms ease;
+}
+
+.cb-cloud-card.is-error .cb-cloud-fill {
+  width: 0% !important;
+  background: transparent;
+  box-shadow: none;
+}
+
+.cb-cloud-card.is-error .cb-cloud-rail {
+  display: none;
+}
+
+.cb-cloud-error {
+  margin-top: 6px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10.5px;
+  color: #ffd0c2;
+  line-height: 1.4;
+  word-break: break-word;
+}
+.cb-cloud-error[hidden] { display: none; }
+

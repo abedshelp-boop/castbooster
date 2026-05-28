@@ -233,6 +233,22 @@
       </div>
     </div>
 
+    <!-- P3.6: Cloud-warmup status card. Surfaces cloud_state /
+         cloud_warming_s / cloud_error fields from get_session_status.
+         Hidden by default; popup.js reveals when cloud_state is non-empty. -->
+    <div class="cb-cloud-wrap" id="cloudStatusCard" hidden>
+      <div class="cb-cloud-card">
+        <div class="cb-cloud-row">
+          <span class="cb-cloud-text" id="cloudStatusText">Warming up cloud GPU…</span>
+          <span class="cb-cloud-elapsed" id="cloudStatusElapsed">0s</span>
+        </div>
+        <div class="cb-cloud-rail">
+          <div class="cb-cloud-fill" id="cloudStatusFill"></div>
+        </div>
+        <div class="cb-cloud-error" id="cloudStatusError" hidden></div>
+      </div>
+    </div>
+
     <!-- Transport -->
     <div class="cb-transport-wrap">
       <div class="cb-transport">
