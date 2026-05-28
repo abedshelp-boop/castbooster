@@ -87,6 +87,47 @@ def _another_instance_healthy() -> bool:
         return False
 
 
+def _terminate_cloud_orphans_on_startup() -> None:
+    """Best-effort: kill any pods left running from a crashed previous session.
+
+    Reads CLOUD_API_KEY + RUNPOD_API_KEY from env. If either is missing,
+    silently no-ops (the user hasn't configured cloud yet). Any exception
+    is logged and swallowed — orphan cleanup must NEVER block app startup.
+    """
+    import os
+    log = logging.getLogger("castbooster")
+    if not (os.environ.get("CLOUD_API_KEY") and os.environ.get("RUNPOD_API_KEY")):
+        log.debug("cloud env not configured — skipping orphan termination")
+        return
+    try:
+        from castbooster.cloud.cloud_cast import build_orchestrator
+        orch = build_orchestrator()
+        count = orch.terminate_orphans(hard_cap_s=6 * 3600)
+        if count:
+            log.info("terminated %d cloud orphan pod(s) on startup", count)
+    except Exception:
+        log.exception("cloud orphan termination skipped (continuing startup)")
+
+
+def _shutdown_cloud_pods_on_exit() -> None:
+    """Best-effort terminate everything in cloud state. Registered via
+    atexit alongside wakelock.force_release_all. Must NEVER raise —
+    Python suppresses atexit exceptions but they pollute stderr.
+    """
+    import os
+    log = logging.getLogger("castbooster")
+    if not (os.environ.get("CLOUD_API_KEY") and os.environ.get("RUNPOD_API_KEY")):
+        return
+    try:
+        from castbooster.cloud.cloud_cast import build_orchestrator
+        orch = build_orchestrator()
+        count = orch.shutdown_all()
+        if count:
+            log.info("terminated %d cloud pod(s) on exit", count)
+    except Exception:
+        log.exception("cloud shutdown_all on exit failed")
+
+
 def main() -> int:
     setup_logging()
     _install_sys_excepthook()
@@ -118,6 +159,8 @@ def main() -> int:
         except FFmpegProbeError as e:
             log.error("ffmpeg probe failed — Pillar 2 transcode disabled. detail=%s", e)
 
+        _terminate_cloud_orphans_on_startup()
+
         proxy = start_proxy(on_ready=lambda ip: log.info("proxy ready on LAN IP %s", ip))
         if not proxy.wait_ready(timeout=5.0):
             log.error(
@@ -137,6 +180,7 @@ def main() -> int:
         # signal handlers cover Ctrl+C / taskkill /T / Ctrl+Break. Each calls
         # force_release_all which is idempotent.
         atexit.register(wakelock.force_release_all)
+        atexit.register(_shutdown_cloud_pods_on_exit)
 
         def _signal_handler(signum, _frame):  # noqa: ANN001 — signal signature
             log.info("signal %s received — releasing wakelock and exiting", signum)
