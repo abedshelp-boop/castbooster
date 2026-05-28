@@ -5,3 +5,8 @@ Pillow>=10,<12
 httpx>=0.27,<1
 pytest>=8,<9
 respx>=0.21,<1
+# Integration-test only: spin up a fake cloud worker against which the
+# real orchestrator drives its v0.3.0 contract (Pillar 3.6 Task 21).
+# Not used in production runtime.
+fastapi>=0.110,<1
+uvicorn>=0.30,<1
