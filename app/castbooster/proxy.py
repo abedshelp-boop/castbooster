@@ -113,6 +113,15 @@ _WARMING_TIMEOUT_BY_TIER = {
     "sw":     24.0,   # Pillar 3.5: 12s was too tight on cold libx264 starts
 }
 
+# Pillar 3.5: RIFE adds cold-start cost (Vulkan ICD load + shader compile +
+# first 2s batch of interpolated rawvideo, ~50→120 frames at typical 720p)
+# that dwarfs the encoder's own warm-up. Without this, every HW tier (all
+# 6s above) times out before RIFE produces its first frame and the cast
+# silently demotes to passthrough. Apply max(tier_budget, this) whenever
+# the chain has a non-Noop stage. (Production log 2026-05-21 18:16:23:
+# mf tier, budget=6.0s, warming_timed_out elapsed=6.01s with chain=rife.)
+_WARMING_TIMEOUT_WITH_RIFE = 30.0
+
 _PASSTHROUGH_ENV_TRUTHY = {"1", "true", "yes"}
 
 
@@ -327,9 +336,15 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
         # P3.4: pick NoopFilter vs RIFEFilter per spec §4.2. caps lookup is
         # cheap (in-memory table); probe_input_video runs ffprobe in a
         # subprocess so it goes in the executor.
+        # Probe via the loopback URL — not the raw upstream — so the proxy's
+        # PNG-strip + cookie replay + header impersonation are applied before
+        # ffprobe reads the first segment. Sites that disguise CDN segments
+        # as PNG (masukestin.com, audinifer.com) otherwise break probing,
+        # which silently demotes smooth=True to NoopFilter via the §4.2
+        # probe_failed branch.
         caps = cm.capabilities(cast_uuid)
         video = await loop.run_in_executor(
-            None, ffmpeg_probe.probe_input_video, sess.upstream_url,
+            None, ffmpeg_probe.probe_input_video, upstream_loopback_url,
         )
         # Cache for _handle_set_filter_chain so the toggle doesn't re-probe
         # ffprobe every time the user flips it.
@@ -338,6 +353,13 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
         filter_chain, info_message = _build_filter_chain(
             enable_smooth=enable_smooth, caps=caps, video=video,
         )
+        # Pillar 3.5: when the chain has a non-Noop stage (RIFE today, other
+        # interpolators in the future), extend the warming budget to cover
+        # the side-task cold-start. See _WARMING_TIMEOUT_WITH_RIFE.
+        if filter_chain.stages and not isinstance(
+            filter_chain.stages[0], NoopFilter
+        ):
+            warming_timeout = max(warming_timeout, _WARMING_TIMEOUT_WITH_RIFE)
         log.info(
             "[cast token=%s] spawning transcoder accel=%s/%s/%s budget=%.1fs "
             "smooth=%s chain=%s base=%s",

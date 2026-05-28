@@ -337,6 +337,194 @@ def test_handle_cast_enable_smooth_true_without_pro_rejected():
     _run(_go())
 
 
+def test_handle_cast_probes_via_loopback_proxy_url():
+    """Regression: smooth-probe must go through the loopback proxy URL so
+    PNG-strip + cookie replay are applied before ffprobe reads the first
+    segment. Sites that disguise CDN segments as PNG (masukestin.com,
+    audinifer.com, ...) otherwise fail probing and silently demote to
+    NoopFilter even with smooth=True. (Reproduced in production log
+    2026-05-21 17:33:26 — ffprobe exit=1 on tiktokcdn .image URL → branch
+    =probe_failed → chain=noop.)
+    """
+    from castbooster.transcoder import TranscoderState as _TS
+
+    class _FakeTranscoder:
+        def __init__(self, **kw):
+            self._state = _TS.IDLE
+            self._output_dir = kw.get("base_output_dir", Path("/tmp/fake")) / "v1"
+        @property
+        def state(self): return self._state
+        @property
+        def idle_reason(self): return None
+        @property
+        def output_dir(self): return self._output_dir
+        def start(self): self._state = _TS.WARMING
+        def wait_until_ready(self, timeout=None):
+            self._state = _TS.READY
+            return True
+        def stop(self, drain_seconds=2.0): self._state = _TS.TERMINATED
+
+    captured_urls: list[str] = []
+
+    def _record_url(url, *args, **kwargs):
+        captured_urls.append(url)
+        return _video_60fps_hd()
+
+    async def _go():
+        app = _build_test_app()
+        raw_upstream = "https://audinifer.com/stream/ngx/index-f2-v1-a1.m3u8"
+        sess = app["session_store"].create(raw_upstream)
+        cast_uuid = "12345678-1234-5678-1234-567812345678"
+        with patch("castbooster.proxy.Transcoder", _FakeTranscoder), \
+             patch("castbooster.proxy.license.is_pro", return_value=True), \
+             patch("castbooster.proxy.ffmpeg_probe.probe_input_video",
+                   side_effect=_record_url):
+            resp = await _handle_cast(
+                app,
+                {"token": sess.token, "castUuid": cast_uuid,
+                 "enable_smooth": True},
+            )
+        assert resp["status"] == "ok"
+        assert len(captured_urls) == 1, (
+            f"expected exactly one probe, got {captured_urls}"
+        )
+        probed = captured_urls[0]
+        assert probed.startswith("http://127.0.0.1:"), (
+            f"probe was called with non-loopback URL {probed!r}; that "
+            f"skips proxy transformations (PNG-strip, cookie replay) and "
+            f"breaks probing on PNG-disguised CDN segments — see "
+            f"production log 2026-05-21 17:33:26."
+        )
+        assert f"/s/{sess.token}/upstream/master.m3u8" in probed
+        # Negative: probe must not be handed the raw upstream URL.
+        assert "audinifer.com" not in probed
+
+    _run(_go())
+
+
+def test_handle_cast_with_rife_chain_extends_warming_timeout():
+    """When the chain contains a RIFE stage, the warming budget must exceed
+    the HW-encoder default so Vulkan ICD cold-start + shader compile + the
+    first interpolated 2s batch (e.g. 50→120 frames at 720p) can complete
+    before _ProcessSlot marks the transcoder FAILED. Without this, every
+    HW tier (nvidia/intel/amd/mf, all 6.0s) times out and the cast falls
+    back to passthrough — defeating the whole point of smooth=True.
+    (Reproduced in production log 2026-05-21 18:16:23: mf tier, budget
+    6.0s, warming_timed_out elapsed=6.01s with chain=rife.)
+    """
+    from castbooster.transcoder import TranscoderState as _TS
+
+    captured = {}
+
+    class _FakeTranscoder:
+        def __init__(self, *, warming_timeout, filter_chain, **kw):
+            captured["warming_timeout"] = warming_timeout
+            captured["chain"] = filter_chain
+            self._state = _TS.IDLE
+            self._output_dir = kw.get("base_output_dir", Path("/tmp/fake")) / "v1"
+        @property
+        def state(self): return self._state
+        @property
+        def idle_reason(self): return None
+        @property
+        def output_dir(self): return self._output_dir
+        def start(self): self._state = _TS.WARMING
+        def wait_until_ready(self, timeout=None):
+            self._state = _TS.READY
+            return True
+        def stop(self, drain_seconds=2.0): self._state = _TS.TERMINATED
+
+    fake_rife = MagicMock(name="RIFEFilter")
+    fake_rife.pipeline_spec.return_value = MagicMock()
+    fake_rife.render.return_value = "null"
+
+    async def _go():
+        app = _build_test_app()
+        # Use the mf tier — the one Abed actually hit in production.
+        app["accel_profile"] = AccelProfile(
+            ffmpeg_path="C:/fake/ffmpeg.exe",
+            encoder="h264_mf", decoder="none", tier="mf",
+        )
+        sess = app["session_store"].create("https://example.com/p.m3u8")
+        cast_uuid = "12345678-1234-5678-1234-567812345678"
+        with patch("castbooster.proxy.Transcoder", _FakeTranscoder), \
+             patch("castbooster.proxy.license.is_pro", return_value=True), \
+             patch("castbooster.proxy.ffmpeg_probe.probe_input_video",
+                   return_value=_video_60fps_hd()), \
+             patch("castbooster.proxy.RIFEFilter", return_value=fake_rife):
+            resp = await _handle_cast(
+                app,
+                {"token": sess.token, "castUuid": cast_uuid,
+                 "enable_smooth": True},
+            )
+        assert resp["status"] == "ok"
+        # Sanity: chain actually has RIFE
+        assert captured["chain"].stages[0] is fake_rife
+        # The fix: warming_timeout must be ≥ 30s when RIFE is in the chain.
+        assert captured["warming_timeout"] >= 30.0, (
+            f"warming_timeout={captured['warming_timeout']}s is too tight "
+            f"for the RIFE cold-start (Vulkan shader compile + first "
+            f"50→120 frame batch at 720p). HW tier defaults (6s) cause "
+            f"warming_timed_out before RIFE produces output — see "
+            f"production log 2026-05-21 18:16:23."
+        )
+
+    _run(_go())
+
+
+def test_handle_cast_with_noop_chain_keeps_tier_warming_timeout():
+    """Negative: a Noop chain (no RIFE) keeps the tier default so a stuck
+    HW encoder still fails fast. If this regresses, someone applied the
+    RIFE-extended budget unconditionally and lost fast-fail on HW.
+    """
+    from castbooster.transcoder import TranscoderState as _TS
+
+    captured = {}
+
+    class _FakeTranscoder:
+        def __init__(self, *, warming_timeout, filter_chain, **kw):
+            captured["warming_timeout"] = warming_timeout
+            self._state = _TS.IDLE
+            self._output_dir = kw.get("base_output_dir", Path("/tmp/fake")) / "v1"
+        @property
+        def state(self): return self._state
+        @property
+        def idle_reason(self): return None
+        @property
+        def output_dir(self): return self._output_dir
+        def start(self): self._state = _TS.WARMING
+        def wait_until_ready(self, timeout=None):
+            self._state = _TS.READY
+            return True
+        def stop(self, drain_seconds=2.0): self._state = _TS.TERMINATED
+
+    async def _go():
+        app = _build_test_app()
+        app["accel_profile"] = AccelProfile(
+            ffmpeg_path="C:/fake/ffmpeg.exe",
+            encoder="h264_mf", decoder="none", tier="mf",
+        )
+        sess = app["session_store"].create("https://example.com/p.m3u8")
+        cast_uuid = "12345678-1234-5678-1234-567812345678"
+        with patch("castbooster.proxy.Transcoder", _FakeTranscoder):
+            resp = await _handle_cast(
+                app,
+                {"token": sess.token, "castUuid": cast_uuid,
+                 "enable_smooth": False},
+            )
+        assert resp["status"] == "ok"
+        # Noop chain on the mf tier: warming budget stays well below the
+        # RIFE-extended ceiling.
+        assert captured["warming_timeout"] < 30.0, (
+            f"warming_timeout={captured['warming_timeout']}s on a Noop "
+            f"chain — the RIFE-extended budget should only apply when "
+            f"RIFE is in the chain. Otherwise stuck HW encoders take "
+            f"too long to fail."
+        )
+
+    _run(_go())
+
+
 # ---- _handle_set_filter_chain (mid-cast hot-reload) ------------------------
 
 
