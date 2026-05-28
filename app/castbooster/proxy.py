@@ -142,6 +142,61 @@ def _output_playback_url(lan_ip: str, sess: StreamSession) -> tuple[str, str]:
     return url, "application/vnd.apple.mpegurl"
 
 
+def _build_source_headers_for_cloud(sess: StreamSession) -> Dict[str, str]:
+    """Flatten the laptop session's cookies + UA + custom headers into the
+    dict shape the cloud worker's /process expects.
+
+    Cloud worker v0.3.1 forwards these to the upstream via its in-pod
+    source-proxy. Cookies are filtered by upstream host (so cookies set
+    on unrelated domains don't leak to the cloud) and flattened into a
+    single Cookie: name=value; name2=value2 header.
+    """
+    headers: Dict[str, str] = {}
+    if sess.user_agent:
+        headers["User-Agent"] = sess.user_agent
+    # Pass through any custom session headers (e.g. Referer set during
+    # register_stream from the browser extension).
+    for k, v in (sess.headers or {}).items():
+        if k and v and k.lower() != "cookie":
+            headers[k] = v
+    # Build a single Cookie header from the cookies that match upstream host.
+    host = (urlparse(sess.upstream_url).hostname or "").lower()
+    cookie_map = _cookies_for_host(sess.cookies, host)
+    if cookie_map:
+        cookie_str = "; ".join(f"{n}={v}" for n, v in cookie_map.items())
+        headers["Cookie"] = cookie_str
+    return headers
+
+
+def _make_cloud_on_session_end_callback(
+    sess: StreamSession, pod_id: str, log_token: str,
+):
+    """Build the on_session_end callback for the cloud branch.
+
+    Per Lock 4 (amendments 2026-05-28): explicit terminate on cast end
+    + worker's 10min idle_watcher as backstop. We import build_orchestrator
+    lazily so the closure doesn't hold a reference; the orchestrator is
+    constructed fresh from env on demand. Errors in the terminate call
+    must NOT propagate — the cast session is already over.
+    """
+    def _on_end() -> None:
+        try:
+            from castbooster.cloud.cloud_cast import build_orchestrator
+            orch = build_orchestrator()
+            orch.terminate_pod(pod_id)
+            log.info(
+                "[cast token=%s] cloud pod %s terminated on session end",
+                log_token, pod_id,
+            )
+        except Exception:
+            log.exception(
+                "[cast token=%s] cloud pod %s terminate on session end failed (best-effort)",
+                log_token, pod_id,
+            )
+        sess.cloud_pod_id = None
+    return _on_end
+
+
 NMHandler = Callable[[web.Application, dict], Awaitable[dict]]
 
 
@@ -356,80 +411,161 @@ async def _handle_cast(app: web.Application, msg: dict) -> dict:
         # Pillar 3.5: when the chain has a non-Noop stage (RIFE today, other
         # interpolators in the future), extend the warming budget to cover
         # the side-task cold-start. See _WARMING_TIMEOUT_WITH_RIFE.
-        if filter_chain.stages and not isinstance(
+        chain_is_smooth = bool(filter_chain.stages) and not isinstance(
             filter_chain.stages[0], NoopFilter
-        ):
+        )
+        if chain_is_smooth:
             warming_timeout = max(warming_timeout, _WARMING_TIMEOUT_WITH_RIFE)
-        log.info(
-            "[cast token=%s] spawning transcoder accel=%s/%s/%s budget=%.1fs "
-            "smooth=%s chain=%s base=%s",
-            log_token, accel.encoder, accel.decoder, accel.tier,
-            warming_timeout, enable_smooth,
-            "rife" if filter_chain.stages and not isinstance(
-                filter_chain.stages[0], NoopFilter
-            ) else "noop",
-            base_output_dir,
-        )
-        transcoder = Transcoder(
-            input_url=upstream_loopback_url,
-            base_output_dir=base_output_dir,
-            accel=accel,
-            filter_chain=filter_chain,
-            warming_timeout=warming_timeout,
-        )
-        sess.transcoder = transcoder
-        sess.output_dir = base_output_dir
-        try:
-            await loop.run_in_executor(None, transcoder.start)
-            log.info("[cast token=%s] transcoder WARMING", log_token)
-            t0 = time.monotonic()
-            ready = await loop.run_in_executor(
-                None, transcoder.wait_until_ready, warming_timeout
-            )
-            elapsed = time.monotonic() - t0
-        except Exception as e:
-            log.exception("[cast token=%s] transcoder.start crashed", log_token)
-            ready = False
-            elapsed = 0.0
-            try:
-                await loop.run_in_executor(None, transcoder.stop)
-            except Exception:
-                log.exception("[cast token=%s] transcoder.stop after crash failed", log_token)
-            sess.transcoder = None
-            sess.output_dir = None
-            sess.passthrough_only = True
-            cm.record_transcoder_failure(f"start_exception:{type(e).__name__}")
-        if ready:
+
+        # P3.6 cloud-only-forever branch: when the chain would have been
+        # non-Noop (smooth path), fork to the cloud worker INSTEAD of the
+        # local Transcoder. See
+        # docs/superpowers/specs/2026-05-28-pillar-3.6-tasks-13-26-amendments-design.md
+        # Locks 1, 2, 4. The local RIFEFilter path is dead code on this
+        # branch as of 2026-05-28 — kept in _build_filter_chain only so
+        # the existing test surface stays stable; never executed.
+        if chain_is_smooth:
+            source_headers = _build_source_headers_for_cloud(sess)
             log.info(
-                "[cast token=%s] transcoder READY in %.2fs (slot=v1)",
-                log_token, elapsed,
-            )
-        elif sess.passthrough_only:
-            # Already fell back above due to start-crash.
-            pass
-        else:
-            reason = transcoder.idle_reason or "warming_timed_out"
-            log.warning(
-                "[cast token=%s] transcoder FAILED reason=%s elapsed=%.2fs",
-                log_token, reason, elapsed,
-            )
-            cm.record_transcoder_failure(reason)
-            stats = cm.transcoder_failure_stats()
-            log.warning(
-                "[cast token=%s] failure counter: total=%d by_reason=%s",
-                log_token, stats["total"], stats["by_reason"],
-            )
-            try:
-                await loop.run_in_executor(None, transcoder.stop)
-            except Exception:
-                log.exception("[cast token=%s] transcoder.stop after FAILED failed", log_token)
-            sess.transcoder = None
-            sess.output_dir = None
-            sess.passthrough_only = True
-            log.info(
-                "[cast token=%s] falling back to passthrough; session.passthrough_only=True",
+                "[cast token=%s] cloud branch: smooth chain decided; calling cloud_cast",
                 log_token,
             )
+            sess.cloud_warming_status = "calling_cloud"
+            from castbooster.cloud.cloud_cast import cloud_cast as _cloud_cast
+            result = await loop.run_in_executor(
+                None,
+                lambda: _cloud_cast(
+                    source_url=sess.upstream_url,
+                    source_headers=source_headers,
+                ),
+            )
+            if result.ok:
+                sess.cloud_pod_id = result.pod_id
+                sess.cloud_hls_url = result.hls_url
+                sess.cloud_warming_status = result.warming_status or "streaming"
+                sess.cloud_error = ""
+                # Substitute the playback URL with the cloud HLS URL and
+                # override _on_session_end to terminate the pod. Skip the
+                # local Transcoder + the existing playback-URL building.
+                cloud_playback_url = result.hls_url
+                cloud_content_type = "application/vnd.apple.mpegurl"
+                cloud_on_end = _make_cloud_on_session_end_callback(
+                    sess, result.pod_id, log_token,
+                )
+                log.info(
+                    "[cast token=%s] cloud cast → %s (pod=%s)",
+                    log_token, cloud_playback_url[:120], result.pod_id,
+                )
+                try:
+                    name = await loop.run_in_executor(
+                        None,
+                        lambda: cm.play(
+                            cast_uuid, cloud_playback_url, cloud_content_type,
+                            on_session_end=cloud_on_end,
+                            log_token=token,
+                        ),
+                    )
+                except LookupError as e:
+                    return {"type": "casting", "status": "error", "detail": str(e)}
+                except Exception as e:
+                    log.exception("[cast token=%s] cm.play (cloud) failed", log_token)
+                    return {
+                        "type": "casting", "status": "error",
+                        "detail": f"play_media failed: {e}",
+                    }
+                resp: Dict[str, Any] = {
+                    "type": "casting",
+                    "status": "ok",
+                    "detail": f"Playback started on {name}",
+                    "playbackUrl": cloud_playback_url,
+                }
+                if info_message:
+                    resp["info_message"] = info_message
+                return resp
+            else:
+                # Cloud failure → fall through to passthrough. info_message
+                # from _build_filter_chain (if any) is overridden by the
+                # cloud failure message so the popup surfaces the real reason.
+                sess.cloud_error = result.error
+                sess.cloud_warming_status = result.warming_status or "failed"
+                info_message = f"Cloud cast failed: {result.error}"
+                sess.passthrough_only = True
+                log.warning(
+                    "[cast token=%s] cloud cast failed (%s); falling to passthrough",
+                    log_token, result.error,
+                )
+
+        # Only spawn the local Transcoder for Noop chains (smooth=False or
+        # any §4.2 demote condition). Smooth chains went through the cloud
+        # branch above and either returned early (success) or set
+        # passthrough_only=True (failure) — neither falls into this block.
+        if not chain_is_smooth and not sess.passthrough_only:
+            log.info(
+                "[cast token=%s] spawning transcoder accel=%s/%s/%s budget=%.1fs "
+                "smooth=%s chain=noop base=%s",
+                log_token, accel.encoder, accel.decoder, accel.tier,
+                warming_timeout, enable_smooth, base_output_dir,
+            )
+            transcoder = Transcoder(
+                input_url=upstream_loopback_url,
+                base_output_dir=base_output_dir,
+                accel=accel,
+                filter_chain=filter_chain,
+                warming_timeout=warming_timeout,
+            )
+            sess.transcoder = transcoder
+            sess.output_dir = base_output_dir
+            try:
+                await loop.run_in_executor(None, transcoder.start)
+                log.info("[cast token=%s] transcoder WARMING", log_token)
+                t0 = time.monotonic()
+                ready = await loop.run_in_executor(
+                    None, transcoder.wait_until_ready, warming_timeout
+                )
+                elapsed = time.monotonic() - t0
+            except Exception as e:
+                log.exception("[cast token=%s] transcoder.start crashed", log_token)
+                ready = False
+                elapsed = 0.0
+                try:
+                    await loop.run_in_executor(None, transcoder.stop)
+                except Exception:
+                    log.exception("[cast token=%s] transcoder.stop after crash failed", log_token)
+                sess.transcoder = None
+                sess.output_dir = None
+                sess.passthrough_only = True
+                cm.record_transcoder_failure(f"start_exception:{type(e).__name__}")
+            if ready:
+                log.info(
+                    "[cast token=%s] transcoder READY in %.2fs (slot=v1)",
+                    log_token, elapsed,
+                )
+            elif sess.passthrough_only:
+                # Already fell back above due to start-crash.
+                pass
+            else:
+                reason = transcoder.idle_reason or "warming_timed_out"
+                log.warning(
+                    "[cast token=%s] transcoder FAILED reason=%s elapsed=%.2fs",
+                    log_token, reason, elapsed,
+                )
+                cm.record_transcoder_failure(reason)
+                stats = cm.transcoder_failure_stats()
+                log.warning(
+                    "[cast token=%s] failure counter: total=%d by_reason=%s",
+                    log_token, stats["total"], stats["by_reason"],
+                )
+                try:
+                    await loop.run_in_executor(None, transcoder.stop)
+                except Exception:
+                    log.exception("[cast token=%s] transcoder.stop after FAILED failed", log_token)
+                sess.transcoder = None
+                sess.output_dir = None
+                sess.passthrough_only = True
+                log.info(
+                    "[cast token=%s] falling back to passthrough; session.passthrough_only=True",
+                    log_token,
+                )
 
     # Step 5-6: build playback URL + on_session_end + dispatch
     if sess.passthrough_only:
@@ -634,6 +770,12 @@ async def _handle_set_filter_chain(app: web.Application, msg: dict) -> dict:
         return {"type": "filter_chain_set", "status": "error",
                 "detail": "unknown token"}
     transcoder = sess.transcoder
+    if transcoder is None and sess.cloud_pod_id:
+        # P3.6 MVP: smooth toggle during a cloud cast not supported. User
+        # must stop + restart to switch modes. Phase 2: stop cloud + spawn
+        # local Transcoder for audio-only re-encode.
+        return {"type": "filter_chain_set", "status": "error",
+                "detail": "smooth toggle not supported during cloud cast — stop + restart"}
     if transcoder is None:
         return {"type": "filter_chain_set", "status": "error",
                 "detail": "no active transcoder for this session"}
@@ -709,21 +851,50 @@ async def _handle_get_session_status(app: web.Application, msg: dict) -> dict:
     token = msg.get("token")
     store: SessionStore = app["session_store"]
     sess = store.get(token) if isinstance(token, str) else None
-    if sess is None or sess.transcoder is None:
+    if sess is None:
         return {
             "type": "session_status",
             "state": "no_session",
             "enable_smooth_actual": False,
             "warnings": [],
+            "cloud_state": "",
+            "cloud_warming_s": 0.0,
+            "cloud_error": "",
         }
-    transcoder = sess.transcoder
     warnings = list(sess.pending_warnings)
     sess.pending_warnings.clear()
+    transcoder = sess.transcoder
+    if transcoder is None and sess.cloud_pod_id:
+        # P3.6: cloud cast in flight — transcoder is None because the cloud
+        # branch skipped the local Transcoder spawn entirely. Surface
+        # cloud-side state for the popup warmup card.
+        return {
+            "type": "session_status",
+            "state": "cloud",
+            "enable_smooth_actual": True,  # cloud is smooth by definition
+            "warnings": warnings,
+            "cloud_state": sess.cloud_warming_status,
+            "cloud_warming_s": time.time() - sess.created_at,
+            "cloud_error": sess.cloud_error,
+        }
+    if transcoder is None:
+        return {
+            "type": "session_status",
+            "state": "no_session",
+            "enable_smooth_actual": False,
+            "warnings": warnings,
+            "cloud_state": "",
+            "cloud_warming_s": 0.0,
+            "cloud_error": "",
+        }
     return {
         "type": "session_status",
         "state": transcoder.state.name.lower(),
         "enable_smooth_actual": transcoder.has_active_pipeline(),
         "warnings": warnings,
+        "cloud_state": "",
+        "cloud_warming_s": 0.0,
+        "cloud_error": "",
     }
 
 

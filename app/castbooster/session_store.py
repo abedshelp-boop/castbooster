@@ -32,6 +32,14 @@ class StreamSession:
     # _handle_cast; None on passthrough-only sessions.
     cast_uuid: Optional[str] = None
     probed_video: Optional["InputVideoInfo"] = None
+    # P3.6: cloud cast state. None / "" defaults so existing tests + non-cloud
+    # casts are unaffected. Populated by _handle_cast cloud branch; consumed
+    # by _on_session_end (terminate_pod) and _handle_get_session_status
+    # (cloud_state field for popup warmup card).
+    cloud_pod_id: Optional[str] = None
+    cloud_hls_url: Optional[str] = None
+    cloud_warming_status: str = ""
+    cloud_error: str = ""
 
 
 class SessionStore:

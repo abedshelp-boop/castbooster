@@ -13,6 +13,8 @@ import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from castbooster.ffmpeg_probe import AccelProfile, InputVideoInfo
 from castbooster.filter_chain import FilterChain, NoopFilter
 from castbooster.proxy import (
@@ -223,6 +225,10 @@ def test_build_filter_chain_30cap_target():
 # ---- _handle_cast extension: reads enable_smooth, returns info_message -----
 
 
+@pytest.mark.skip(reason="P3.6 cloud-only-forever: smooth=True no longer "
+                  "spawns local Transcoder — see test_proxy_cloud.py for "
+                  "the cloud-branch equivalents (cloud_cast call + cm.play "
+                  "with cloud HLS URL).")
 def test_handle_cast_passes_enable_smooth_through_to_filter_chain():
     """enable_smooth=True + happy probe → handler constructs Transcoder with
     a RIFE-bearing FilterChain (verified via the FilterChain arg captured on
@@ -345,24 +351,14 @@ def test_handle_cast_probes_via_loopback_proxy_url():
     NoopFilter even with smooth=True. (Reproduced in production log
     2026-05-21 17:33:26 — ffprobe exit=1 on tiktokcdn .image URL → branch
     =probe_failed → chain=noop.)
-    """
-    from castbooster.transcoder import TranscoderState as _TS
 
-    class _FakeTranscoder:
-        def __init__(self, **kw):
-            self._state = _TS.IDLE
-            self._output_dir = kw.get("base_output_dir", Path("/tmp/fake")) / "v1"
-        @property
-        def state(self): return self._state
-        @property
-        def idle_reason(self): return None
-        @property
-        def output_dir(self): return self._output_dir
-        def start(self): self._state = _TS.WARMING
-        def wait_until_ready(self, timeout=None):
-            self._state = _TS.READY
-            return True
-        def stop(self, drain_seconds=2.0): self._state = _TS.TERMINATED
+    P3.6 update (2026-05-28): probe still happens BEFORE the cloud branch
+    fork — _build_filter_chain needs source FPS regardless of whether the
+    interpolation runs locally or in the cloud. So this regression
+    assertion (loopback URL was used) still holds; we just patch
+    cloud_cast so the smooth path doesn't try real RunPod calls.
+    """
+    from castbooster.cloud.cloud_cast import CloudCastResult
 
     captured_urls: list[str] = []
 
@@ -370,15 +366,23 @@ def test_handle_cast_probes_via_loopback_proxy_url():
         captured_urls.append(url)
         return _video_60fps_hd()
 
+    fake_cloud_result = CloudCastResult(
+        ok=True,
+        hls_url="https://pod-stub-8080.proxy.runpod.net/hls/playlist.m3u8",
+        pod_id="pod-stub",
+        warming_status="streaming",
+    )
+
     async def _go():
         app = _build_test_app()
         raw_upstream = "https://audinifer.com/stream/ngx/index-f2-v1-a1.m3u8"
         sess = app["session_store"].create(raw_upstream)
         cast_uuid = "12345678-1234-5678-1234-567812345678"
-        with patch("castbooster.proxy.Transcoder", _FakeTranscoder), \
-             patch("castbooster.proxy.license.is_pro", return_value=True), \
+        with patch("castbooster.proxy.license.is_pro", return_value=True), \
              patch("castbooster.proxy.ffmpeg_probe.probe_input_video",
-                   side_effect=_record_url):
+                   side_effect=_record_url), \
+             patch("castbooster.cloud.cloud_cast.cloud_cast",
+                   return_value=fake_cloud_result):
             resp = await _handle_cast(
                 app,
                 {"token": sess.token, "castUuid": cast_uuid,
@@ -402,6 +406,13 @@ def test_handle_cast_probes_via_loopback_proxy_url():
     _run(_go())
 
 
+@pytest.mark.skip(reason="P3.6 cloud-only-forever: smooth=True no longer "
+                  "spawns local Transcoder, so the local warming-timeout "
+                  "tuning for RIFE is unreachable on this branch. The "
+                  "cloud-branch budget lives in CloudOrchestrator's "
+                  "playlist_ready_timeout_s (90s). Kept as skip rather "
+                  "than deletion to preserve the production-log breadcrumb "
+                  "for the future cleanup pillar.")
 def test_handle_cast_with_rife_chain_extends_warming_timeout():
     """When the chain contains a RIFE stage, the warming budget must exceed
     the HW-encoder default so Vulkan ICD cold-start + shader compile + the
