@@ -3,6 +3,10 @@ pychromecast>=14.0,<15
 pystray>=0.19,<0.20
 Pillow>=10,<12
 httpx>=0.27,<1
+# Pillar 3.6: load .env at main.py startup so cloud env vars
+# (CLOUD_API_KEY, RUNPOD_API_KEY, CLOUD_WORKER_IMAGE, CLOUD_GPU_TYPES)
+# don't have to be exported manually in every shell session.
+python-dotenv>=1.0,<2
 pytest>=8,<9
 respx>=0.21,<1
 # Integration-test only: spin up a fake cloud worker against which the

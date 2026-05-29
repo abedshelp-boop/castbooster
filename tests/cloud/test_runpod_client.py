@@ -1,4 +1,4 @@
-"""Tests for app.castbooster.cloud.runpod_client.
+"""Tests for castbooster.cloud.runpod_client.
 
 Mocks RunPod's REST API via respx so we exercise the wrapper logic
 (priority-list retry, body shape, error handling) without burning real
@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from app.castbooster.cloud.runpod_client import (
+from castbooster.cloud.runpod_client import (
     RUNPOD_API_BASE,
     RunPodClient,
     RunPodError,

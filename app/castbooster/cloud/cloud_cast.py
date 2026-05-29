@@ -14,12 +14,12 @@ import logging
 import os
 from dataclasses import dataclass
 
-from app.castbooster.cloud.orchestrator import (
+from castbooster.cloud.orchestrator import (
     CloudOrchestrator,
     OrchestratorError,
 )
-from app.castbooster.cloud.runpod_client import RunPodClient
-from app.castbooster.cloud.state import CloudState, default_state_path
+from castbooster.cloud.runpod_client import RunPodClient
+from castbooster.cloud.state import CloudState, default_state_path
 
 log = logging.getLogger(__name__)
 

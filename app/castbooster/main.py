@@ -1,9 +1,31 @@
 import atexit
 import http.client
 import logging
+import os
 import signal
 import sys
 import threading
+from pathlib import Path
+
+# Pillar 3.6: load .env BEFORE any castbooster.* imports so cloud config
+# (CLOUD_API_KEY, RUNPOD_API_KEY, CLOUD_WORKER_IMAGE, CLOUD_GPU_TYPES) is
+# in os.environ by the time main() calls _terminate_cloud_orphans_on_startup
+# and by the time proxy._handle_cast loads castbooster.cloud.cloud_cast.
+# Search-path: repo root (../../.env from this file) THEN cwd.
+def _load_env_dotfile() -> None:
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return  # python-dotenv not installed — fall back to whatever PowerShell exported
+    # this file lives at app/castbooster/main.py — repo root is two parents up.
+    repo_root_env = Path(__file__).resolve().parents[2] / ".env"
+    if repo_root_env.is_file():
+        load_dotenv(repo_root_env)
+    else:
+        load_dotenv()  # fall back to cwd lookup
+
+
+_load_env_dotfile()
 
 from castbooster import __version__, wakelock
 from castbooster.ffmpeg_probe import (

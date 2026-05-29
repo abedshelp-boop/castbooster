@@ -18,13 +18,13 @@ import httpx
 import pytest
 import respx
 
-from app.castbooster.cloud.orchestrator import (
+from castbooster.cloud.orchestrator import (
     CloudOrchestrator,
     OrchestrationResult,
     OrchestratorError,
 )
-from app.castbooster.cloud.runpod_client import PodInfo, RunPodError
-from app.castbooster.cloud.state import CloudState, PodRecord
+from castbooster.cloud.runpod_client import PodInfo, RunPodError
+from castbooster.cloud.state import CloudState, PodRecord
 
 
 # ---- Helpers ----------------------------------------------------------------

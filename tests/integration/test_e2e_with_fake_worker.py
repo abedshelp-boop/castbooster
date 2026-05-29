@@ -21,13 +21,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.castbooster.cloud.orchestrator import (
+from castbooster.cloud.orchestrator import (
     CloudOrchestrator,
     OrchestrationResult,
     OrchestratorError,
 )
-from app.castbooster.cloud.runpod_client import PodInfo
-from app.castbooster.cloud.state import CloudState
+from castbooster.cloud.runpod_client import PodInfo
+from castbooster.cloud.state import CloudState
 
 from .fake_cloud_worker import (
     FakeWorkerState,

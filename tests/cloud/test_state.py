@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.castbooster.cloud.state import (
+from castbooster.cloud.state import (
     CloudState,
     PodRecord,
     default_state_path,

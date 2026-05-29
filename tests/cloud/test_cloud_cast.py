@@ -2,14 +2,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.castbooster.cloud.cloud_cast import (
+from castbooster.cloud.cloud_cast import (
     CloudConfigError,
     DEFAULT_IMAGE,
     _parse_gpu_types,
     build_orchestrator,
     cloud_cast,
 )
-from app.castbooster.cloud.orchestrator import (
+from castbooster.cloud.orchestrator import (
     OrchestrationResult,
     OrchestratorError,
 )
@@ -56,7 +56,7 @@ def test_build_orchestrator_returns_orchestrator_with_env_config(monkeypatch, tm
     monkeypatch.setenv("CLOUD_GPU_TYPES", "G1,G2")
     # Redirect state path so tests don't write to ~/.castbooster/
     monkeypatch.setattr(
-        "app.castbooster.cloud.cloud_cast.default_state_path",
+        "castbooster.cloud.cloud_cast.default_state_path",
         lambda: tmp_path / "state.json",
     )
     orch = build_orchestrator()
@@ -71,7 +71,7 @@ def test_build_orchestrator_falls_back_to_default_image(monkeypatch, tmp_path):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp")
     monkeypatch.delenv("CLOUD_WORKER_IMAGE", raising=False)
     monkeypatch.setattr(
-        "app.castbooster.cloud.cloud_cast.default_state_path",
+        "castbooster.cloud.cloud_cast.default_state_path",
         lambda: tmp_path / "state.json",
     )
     orch = build_orchestrator()
@@ -94,7 +94,7 @@ def test_cloud_cast_returns_ok_on_orchestrator_success(monkeypatch):
         pod_id="pod123",
     )
     monkeypatch.setattr(
-        "app.castbooster.cloud.cloud_cast.build_orchestrator",
+        "castbooster.cloud.cloud_cast.build_orchestrator",
         lambda: fake_orch,
     )
     result = cloud_cast(
@@ -118,7 +118,7 @@ def test_cloud_cast_returns_failure_on_orchestrator_error(monkeypatch):
         "playlist never ready in 90s"
     )
     monkeypatch.setattr(
-        "app.castbooster.cloud.cloud_cast.build_orchestrator",
+        "castbooster.cloud.cloud_cast.build_orchestrator",
         lambda: fake_orch,
     )
     result = cloud_cast(source_url="x")
@@ -131,7 +131,7 @@ def test_cloud_cast_catches_unexpected_exception(monkeypatch):
     fake_orch = MagicMock()
     fake_orch.ensure_pod_and_process.side_effect = RuntimeError("boom")
     monkeypatch.setattr(
-        "app.castbooster.cloud.cloud_cast.build_orchestrator",
+        "castbooster.cloud.cloud_cast.build_orchestrator",
         lambda: fake_orch,
     )
     result = cloud_cast(source_url="x")

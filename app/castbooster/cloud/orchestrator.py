@@ -24,12 +24,12 @@ from dataclasses import dataclass
 
 import httpx
 
-from app.castbooster.cloud.runpod_client import (
+from castbooster.cloud.runpod_client import (
     PodInfo,
     RunPodClient,
     RunPodError,
 )
-from app.castbooster.cloud.state import (
+from castbooster.cloud.state import (
     CloudState,
     PodRecord,
 )
