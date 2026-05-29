@@ -20,6 +20,11 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
 # Logs / local state
 *.log
 app/castbooster.log
