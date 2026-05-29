@@ -171,8 +171,18 @@ def _ensure_app_running() -> bool:
     return False
 
 
+# P3.6: cloud cast needs ample boot budget — cold image pull on a fresh
+# pod can take 3-6 min, plus another 60-90s for TRT engine compile + first
+# segments. The orchestrator's healthz_boot_timeout_s is 360s and
+# playlist_ready_timeout_s is 90s, so total worst case is ~7.5 min. Add
+# 30s safety margin → 480s here. The popup card UI will show progress
+# during the wait so the user isn't staring at a frozen extension.
+# Pre-cloud value was 30s (sufficient for pure local-proxy operations).
+_NM_FORWARD_TIMEOUT_S = 480
+
+
 def _forward_to_app(payload: dict) -> dict:
-    conn = http.client.HTTPConnection(APP_HOST, APP_PORT, timeout=30)
+    conn = http.client.HTTPConnection(APP_HOST, APP_PORT, timeout=_NM_FORWARD_TIMEOUT_S)
     try:
         body = json.dumps(payload).encode("utf-8")
         conn.request(
