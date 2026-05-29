@@ -89,6 +89,17 @@ _TABLE: dict[str, ReceiverCaps] = {
         supports_ac3=True, supports_eac3=True,
         audio_only=False,
     ),
+    # 2024 device. Caught 2026-05-29 when Abed's "Dining room TV" reported
+    # this model_name and fell through to _UNKNOWN (1080p30), causing smooth
+    # to be skipped for 60fps mux sources via the source_meets_target gate
+    # in _build_filter_chain.
+    "Google TV Streamer": ReceiverCaps(
+        tier="gtv",
+        max_width=3840, max_height=2160, max_fps=60,
+        supports_h265=True, supports_av1=True,
+        supports_ac3=True, supports_eac3=True,
+        audio_only=False,
+    ),
 }
 
 # Audio-only families — match any model_name in this set.
